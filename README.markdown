@@ -1,6 +1,6 @@
 #[CloudI 0.2.0 rc2 (beta)](http://cloudi.org)
 
-[![Build Status](https://secure.travis-ci.org/okeuday/CloudI.png?branch=develop)](http://travis-ci.org/okeuday/CloudI)
+[![Build Status](https://secure.travis-ci.org/okeuday/CloudI.png?branch=master)](http://travis-ci.org/okeuday/CloudI)
 
 ## ABOUT
 
