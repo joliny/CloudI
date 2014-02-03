@@ -27,6 +27,9 @@
 -define(MAPPING_VALUE, <<"boolean">>).
 -define(MAPPING_DOC(Type), [{Type, [{<<"properties">>, [{?MAPPING_KEY, [{<<"type">>, ?MAPPING_VALUE}]}]}]}]).
 -define(ALIASES_DOC(Index, Alias), [{<<"actions">>, [[{<<"add">>, [{<<"index">>, Index}, {<<"alias">>, Alias}]}]]}]).
+-define(UPDATE_KEY, <<"udpate_key">>).
+-define(UPDATE_VALUE, <<"udpate_value">>).
+-define(UPDATE_DOC, [{<<"doc">>, [{?UPDATE_KEY, ?UPDATE_VALUE}]}]).
 % Cloudi
 -define(CLOUDI_CONF, "cloudi.conf").
 -define(DB_PREFIX, "/dbpopulator/elasticsearch/").
@@ -101,23 +104,25 @@ init_per_testcase(_TestCase, Config) ->
 end_per_testcase(_TestCase, _Config) ->
     ok.
 
-groups_condition(Groups) ->
+test_condition(L) ->
     case gen_tcp:connect(?DEFAULT_THRIFT_HOST, ?DEFAULT_THRIFT_PORT, []) of
         {ok, Socket} ->
             catch gen_tcp:close(Socket),
-            Groups;
+            L;
         {error, econnrefused} ->
-            ?LOG_ERROR("unable to test ~p",
-                       [{?DEFAULT_THRIFT_HOST, ?DEFAULT_THRIFT_PORT}]),
-            [];
+            error_logger:error_msg("unable to test ~p",
+                                   [{?DEFAULT_THRIFT_HOST,
+                                     ?DEFAULT_THRIFT_PORT}]),
+            {skip, elasticsearch_dead};
         {error, Reason} ->
-            ?LOG_ERROR("unable to test ~p: ~p",
-                       [{?DEFAULT_THRIFT_HOST, ?DEFAULT_THRIFT_PORT}, Reason]),
-            []
+            error_logger:error_msg("unable to test ~p: ~p",
+                                   [{?DEFAULT_THRIFT_HOST,
+                                     ?DEFAULT_THRIFT_PORT}, Reason]),
+            {skip, elasticsearch_dead}
     end.
 
 groups() ->
-    groups_condition([
+    [
         {crud_index, [],
           [t_is_index_1,
            t_is_index_all,
@@ -165,6 +170,7 @@ groups() ->
        {crud_doc, [],
          [ t_insert_doc, 
           t_get_doc, 
+          t_update_doc, 
           t_delete_doc
          ]},
        {doc_helpers, [],
@@ -190,10 +196,10 @@ groups() ->
           t_delete_by_query_param,
           t_delete_by_query_doc
          ]}
-    ]).
+    ].
 
 all() ->
-    [
+    test_condition([
 %        {group, test}
         {group, crud_index},
         {group, crud_doc},
@@ -203,7 +209,8 @@ all() ->
         {group, doc_helpers},
         {group, crud_mapping},
         {group, aliases}
-    ].
+    ]).
+
 t_health(Config) ->
     Context  = ?config(context, Config),
     Target  = ?config(target, Config),
@@ -745,6 +752,33 @@ t_get_doc(Config) ->
                 true = is_200(Response)
         end, lists:seq(1, ?DOCUMENT_DEPTH)),
     delete_doc(Config).
+
+t_update_doc(Config) ->
+    Context  = ?config(context, Config),
+    Target  = ?config(target, Config),
+    Index = ?config(index, Config),
+    Type = ?config(type, Config),
+    insert_doc(Config),
+    lists:foreach(fun(X) ->
+                BX = list_to_binary(integer_to_list(X)),
+                Doc = ?UPDATE_DOC,
+                {ok, Response1} = cloudi:send_sync(Context, Target, {update_doc, Index, Type, BX, Doc}),
+                true = is_200(Response1),
+                {ok, Response2} = cloudi:send_sync(Context, Target, {get_doc, Index, Type, BX}),
+                validate_update(Response2)
+        end, lists:seq(1, ?DOCUMENT_DEPTH)),
+    delete_doc(Config).
+
+validate_update(Response) ->
+    {body, Data1} = lists:keyfind(body, 1, Response),
+    Data2 = case is_binary(Data1) of
+        true ->
+            cloudi_x_jsx:decode(Data1);
+        false ->
+            Data1
+    end,
+    {_, Data3} = lists:keyfind(<<"_source">>, 1, Data2),
+    {?UPDATE_KEY, ?UPDATE_VALUE} = lists:keyfind(?UPDATE_KEY, 1, Data3).
 
 
 check_status_1(Config, Index) ->

@@ -46,7 +46,7 @@
 %%%
 %%% @author Michael Truog <mjtruog [at] gmail (dot) com>
 %%% @copyright 2012-2013 Michael Truog
-%%% @version 1.3.0 {@date} {@time}
+%%% @version 1.3.1 {@date} {@time}
 %%%------------------------------------------------------------------------
 
 -module(cloudi_service_map_reduce).
@@ -61,6 +61,7 @@
          cloudi_service_terminate/2]).
 
 -include_lib("cloudi_core/include/cloudi_logger.hrl").
+-include_lib("cloudi_core/include/cloudi_service.hrl").
 
 -define(DEFAULT_MAP_REDUCE_MODULE,     undefined).
 -define(DEFAULT_MAP_REDUCE_ARGUMENTS,         []).
@@ -71,7 +72,7 @@
         map_reduce_module,
         map_reduce_state,
         map_count,
-        map_requests    % orddict trans_id -> send_args
+        map_requests       % trans_id -> send_args
     }).
 
 %%%------------------------------------------------------------------------
@@ -83,12 +84,15 @@
 %%%------------------------------------------------------------------------
 
 -callback cloudi_service_map_reduce_new(ModuleReduceArgs :: list(),
+                                        Prefix :: string(),
                                         Dispatcher :: pid()) ->
-    ModuleReduceState :: any().
+    {'ok', ModuleReduceState :: any()} |
+    {'error', Reason :: any()}.
 
 -callback cloudi_service_map_reduce_send(ModuleReduceState :: any(),
                                          Dispatcher :: pid()) ->
     {'ok', SendArgs :: list(), NewModuleReduceState :: any()} |
+    {'done', NewModuleReduceState :: any()} |
     {'error', Reason :: any()}.
 
 -callback cloudi_service_map_reduce_resend(SendArgs :: list(),
@@ -107,11 +111,18 @@
     {'done', NewModuleReduceState :: any()} |
     {'error', Reason :: any()}.
 
+-callback cloudi_service_map_reduce_info(Request :: any(),
+                                         ModuleReduceState :: any(),
+                                         Dispatcher :: pid()) ->
+    {'ok', NewModuleReduceState :: any()} |
+    {'done', NewModuleReduceState :: any()} |
+    {'error', Reason :: any()}.
+
 %%%------------------------------------------------------------------------
 %%% Callback functions from cloudi_service
 %%%------------------------------------------------------------------------
 
-cloudi_service_init(Args, _Prefix, Dispatcher) ->
+cloudi_service_init(Args, Prefix, Dispatcher) ->
     Defaults = [
         {map_reduce,             ?DEFAULT_MAP_REDUCE_MODULE},
         {map_reduce_args,        ?DEFAULT_MAP_REDUCE_ARGUMENTS},
@@ -128,86 +139,114 @@ cloudi_service_init(Args, _Prefix, Dispatcher) ->
         {error, _} ->
             ok = cloudi_x_reltool_util:module_loaded(MapReduceModule)
     end,
-    MapReduceState =
-        MapReduceModule:cloudi_service_map_reduce_new(MapReduceArguments,
-                                                      Dispatcher),
-    MapCount = cloudi_configurator:concurrency(Concurrency),
-    case map_send(MapCount, orddict:new(), Dispatcher,
-                  MapReduceModule, MapReduceState) of
-        {ok, MapRequests, NewMapReduceState} ->
-            {ok, #state{map_reduce_module = MapReduceModule,
-                        map_reduce_state = NewMapReduceState,
-                        map_count = MapCount,
-                        map_requests = MapRequests}};
-        {error, _} = Error ->
-            {stop, Error}
-    end.
+    cloudi_service:self(Dispatcher) !
+        {init, Prefix, MapReduceModule, MapReduceArguments, Concurrency},
+    {ok, undefined}.
 
 cloudi_service_handle_request(_Type, _Name, _Pattern, _RequestInfo, _Request,
                               _Timeout, _Priority, _TransId, _Pid,
                               State, _Dispatcher) ->
     {reply, <<>>, State}.
 
-cloudi_service_handle_info({timeout_async_active, TransId},
-                           #state{map_reduce_module = MapReduceModule,
-                                  map_reduce_state = MapReduceState,
-                                  map_requests = MapRequests} = State,
-                           _Dispatcher) ->
-    SendArgs = orddict:fetch(TransId, MapRequests),
-    NextMapRequests = orddict:erase(TransId, MapRequests),
-    case MapReduceModule:cloudi_service_map_reduce_resend(SendArgs,
-                                                          MapReduceState) of
-        {ok, NewSendArgs, NewMapReduceState} ->
-            case erlang:apply(cloudi_service, send_async_active, NewSendArgs) of
-                {ok, NewTransId} ->
-                    NewMapRequests = orddict:store(NewTransId,
-                                                   NewSendArgs,
-                                                   NextMapRequests),
-                    {noreply,
-                     State#state{map_reduce_state = NewMapReduceState,
-                                 map_requests = NewMapRequests}};
+cloudi_service_handle_info({init, Prefix,
+                            MapReduceModule, MapReduceArguments, Concurrency},
+                           undefined, Dispatcher) ->
+    % cloudi_service_map_reduce_new/3 execution occurs outside of
+    % cloudi_service_init/3 to allow send_sync and recv_sync function calls
+    % because no Erlang process linking/spawning/etc. should be occurring,
+    % only algorithmic initialization
+    case MapReduceModule:cloudi_service_map_reduce_new(MapReduceArguments,
+                                                       Prefix,
+                                                       Dispatcher) of
+        {ok, MapReduceState} ->
+            MapCount = cloudi_configurator:concurrency(Concurrency),
+            case map_send(MapCount, dict:new(), Dispatcher,
+                          MapReduceModule, MapReduceState) of
+                {ok, MapRequests, NewMapReduceState} ->
+                    {noreply, #state{map_reduce_module = MapReduceModule,
+                                     map_reduce_state = NewMapReduceState,
+                                     map_count = MapCount,
+                                     map_requests = MapRequests}};
                 {error, _} = Error ->
-                    {stop, Error, State}
+                    {stop, Error, undefined}
             end;
         {error, _} = Error ->
-            {stop, Error, State}
+            {stop, Error, undefined}
     end;
 
-cloudi_service_handle_info({return_async_active, _Name, _Pattern,
-                            ResponseInfo, Response,
-                            Timeout, TransId},
+cloudi_service_handle_info(#timeout_async_active{trans_id = TransId} = Request,
                            #state{map_reduce_module = MapReduceModule,
                                   map_reduce_state = MapReduceState,
                                   map_requests = MapRequests} = State,
                            Dispatcher) ->
-    SendArgs = orddict:fetch(TransId, MapRequests),
-    case MapReduceModule:cloudi_service_map_reduce_recv(SendArgs,
-                                                        ResponseInfo, Response,
-                                                        Timeout, TransId,
-                                                        MapReduceState,
-                                                        Dispatcher) of
-        {ok, NextMapReduceState} ->
-            case map_send(orddict:erase(TransId, MapRequests),
-                          Dispatcher, MapReduceModule, NextMapReduceState) of
-                {ok, NewMapRequests, NewMapReduceState} ->
-                    {noreply,
-                     State#state{map_reduce_state = NewMapReduceState,
-                                 map_requests = NewMapRequests}};
+    case dict:find(TransId, MapRequests) of
+        {ok, [_ | SendArgs]} ->
+            NextMapRequests = dict:erase(TransId, MapRequests),
+            case MapReduceModule:cloudi_service_map_reduce_resend(
+                [Dispatcher | SendArgs], MapReduceState) of
+                {ok, NewSendArgs, NewMapReduceState} ->
+                    case erlang:apply(cloudi_service, send_async_active,
+                                      NewSendArgs) of
+                        {ok, NewTransId} ->
+                            NewMapRequests = dict:store(NewTransId,
+                                                        NewSendArgs,
+                                                        NextMapRequests),
+                            {noreply,
+                             State#state{map_reduce_state = NewMapReduceState,
+                                         map_requests = NewMapRequests}};
+                        {error, _} = Error ->
+                            {stop, Error, State}
+                    end;
                 {error, _} = Error ->
                     {stop, Error, State}
             end;
-        {done, NewMapReduceState} ->
-            NewMapRequests = orddict:erase(TransId, MapRequests),
-            {noreply,
-             State#state{map_reduce_state = NewMapReduceState,
-                         map_requests = NewMapRequests}};
-        {error, _} = Error ->
-            {stop, Error, State}
+        error ->
+            cloudi_service_map_reduce_info(Request, State, Dispatcher)
     end;
 
-cloudi_service_handle_info(Request, State, _) ->
-    ?LOG_WARN("Unknown info \"~p\"", [Request]),
-    {noreply, State}.
+cloudi_service_handle_info(#return_async_active{response_info = ResponseInfo,
+                                                response = Response,
+                                                timeout = Timeout,
+                                                trans_id = TransId} = Request,
+                           #state{map_reduce_module = MapReduceModule,
+                                  map_reduce_state = MapReduceState,
+                                  map_requests = MapRequests} = State,
+                           Dispatcher) ->
+    case dict:find(TransId, MapRequests) of
+        {ok, [_ | SendArgs]} ->
+            case MapReduceModule:cloudi_service_map_reduce_recv(
+                [Dispatcher | SendArgs], ResponseInfo, Response,
+                Timeout, TransId, MapReduceState, Dispatcher) of
+                {ok, NextMapReduceState} ->
+                    case map_send(dict:erase(TransId, MapRequests),
+                                  Dispatcher, MapReduceModule,
+                                  NextMapReduceState) of
+                        {ok, NewMapRequests, NewMapReduceState} ->
+                            {noreply,
+                             State#state{map_reduce_state = NewMapReduceState,
+                                         map_requests = NewMapRequests}};
+                        {error, _} = Error ->
+                            {stop, Error, State}
+                    end;
+                {done, NewMapReduceState} ->
+                    NewMapRequests = dict:erase(TransId, MapRequests),
+                    NewState = State#state{map_reduce_state = NewMapReduceState,
+                                           map_requests = NewMapRequests},
+                    case dict:size(NewMapRequests) of
+                        0 ->
+                            {stop, shutdown, NewState};
+                        _ ->
+                            {noreply, NewState}
+                    end;
+                {error, _} = Error ->
+                    {stop, Error, State}
+            end;
+        error ->
+            cloudi_service_map_reduce_info(Request, State, Dispatcher)
+    end;
+
+cloudi_service_handle_info(Request, State, Dispatcher) ->
+    cloudi_service_map_reduce_info(Request, State, Dispatcher).
 
 cloudi_service_terminate(_, _) ->
     ok.
@@ -229,12 +268,36 @@ map_send(Count, MapRequests, Dispatcher, MapReduceModule, MapReduceState) ->
             case erlang:apply(cloudi_service, send_async_active, SendArgs) of
                 {ok, TransId} ->
                     map_send(Count - 1,
-                             orddict:store(TransId, SendArgs, MapRequests),
+                             dict:store(TransId, SendArgs, MapRequests),
                              Dispatcher, MapReduceModule, NewMapReduceState);
                 {error, _} = Error ->
                     Error
             end;
+        {done, NewMapReduceState} ->
+            {ok, MapRequests, NewMapReduceState};
         {error, _} = Error ->
             Error
+    end.
+
+cloudi_service_map_reduce_info(Request,
+                               #state{map_reduce_module = MapReduceModule,
+                                      map_reduce_state = MapReduceState,
+                                      map_requests = MapRequests} = State,
+                               Dispatcher) ->
+    case MapReduceModule:cloudi_service_map_reduce_info(Request,
+                                                        MapReduceState,
+                                                        Dispatcher) of
+        {ok, NewMapReduceState} ->
+            {noreply, State#state{map_reduce_state = NewMapReduceState}};
+        {done, NewMapReduceState} ->
+            NewState = State#state{map_reduce_state = NewMapReduceState},
+            case dict:size(MapRequests) of
+                0 ->
+                    {stop, shutdown, NewState};
+                _ ->
+                    {noreply, NewState}
+            end;
+        {error, _} = Error ->
+            {stop, Error, State}
     end.
 

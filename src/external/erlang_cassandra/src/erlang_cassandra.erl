@@ -88,8 +88,12 @@
 -record(state, {
         keyspace                            :: keyspace(),
         set_keyspace                        :: boolean(),
+        connection                          :: connection(),
         connection_options                  :: params(),
-        connection                          :: connection()}).
+        retries_left = 1                    :: non_neg_integer(),
+        retry_interval = 0                  :: non_neg_integer()}).
+
+-type state() :: #state{}.
 
 %% ------------------------------------------------------------------
 %% API
@@ -212,7 +216,7 @@ describe_keyspace(Destination, Keyspace) ->
 %% @doc Add a keyspace
 -spec system_add_keyspace(keyspace_definition()) -> response().
 system_add_keyspace(KeyspaceDefinition) ->
-    system_add_keyspace(?DEFAULT_KEYSPACE, KeyspaceDefinition).
+    system_add_keyspace(?DEFAULT_KEYSPACE_OPS_POOL, KeyspaceDefinition).
 
 -spec system_add_keyspace(destination(), keyspace_definition()) -> response().
 system_add_keyspace(Destination, KeyspaceDefinition) ->
@@ -231,9 +235,9 @@ system_update_keyspace(Destination, KeyspaceDefinition) ->
 %% @doc Remove a keyspace
 -spec system_drop_keyspace(destination()) -> response().
 system_drop_keyspace(Keyspace) when is_binary(Keyspace) ->
-    system_drop_keyspace(?DEFAULT_KEYSPACE, Keyspace);
+    system_drop_keyspace(?DEFAULT_KEYSPACE_OPS_POOL, Keyspace);
 system_drop_keyspace({Host, Port, Keyspace} = _Destination) ->
-    system_drop_keyspace({Host, Port, ?DEFAULT_KEYSPACE}, Keyspace).
+    system_drop_keyspace({Host, Port, ?DEFAULT_KEYSPACE_OPS_POOL}, Keyspace).
 
 -spec system_drop_keyspace(destination(), keyspace()) -> response().
 system_drop_keyspace(Destination, Keyspace) ->
@@ -369,7 +373,7 @@ execute_prepared_cql_query(CqlPool, CqlQuery, Values) when is_integer(CqlQuery),
 %% @doc Get the Thrift API version
 -spec describe_version() -> response().
 describe_version() ->
-    describe_version(?DEFAULT_KEYSPACE).
+    describe_version(?DEFAULT_KEYSPACE_OPS_POOL).
 
 %% @doc Get the Thrift API version
 -spec describe_version(destination()) -> response().
@@ -379,40 +383,40 @@ describe_version(Destination) ->
 %% @doc Get the snitch used for the cluster
 -spec describe_snitch() -> response().
 describe_snitch() ->
-    describe_snitch(?DEFAULT_KEYSPACE).
+    describe_snitch(?DEFAULT_KEYSPACE_OPS_POOL).
 
 %% @doc Get the Thrift API snitch
--spec describe_snitch(keyspace()) -> response().
+-spec describe_snitch(destination()) -> response().
 describe_snitch(Destination) ->
     route_call(Destination, {describe_snitch}, ?POOL_TIMEOUT).
 
 %% @doc Get the partitioner used for the cluster
 -spec describe_partitioner() -> response().
 describe_partitioner() ->
-    describe_partitioner(?DEFAULT_KEYSPACE).
+    describe_partitioner(?DEFAULT_KEYSPACE_OPS_POOL).
 
 %% @doc Get the Thrift API partitioner
--spec describe_partitioner(keyspace()) -> response().
+-spec describe_partitioner(destination()) -> response().
 describe_partitioner(Destination) ->
     route_call(Destination, {describe_partitioner}, ?POOL_TIMEOUT).
 
 %% @doc Get the schema_versions used for the cluster
 -spec describe_schema_versions() -> response().
 describe_schema_versions() ->
-    describe_schema_versions(?DEFAULT_KEYSPACE).
+    describe_schema_versions(?DEFAULT_KEYSPACE_OPS_POOL).
 
 %% @doc Get the Thrift API schema_versions
--spec describe_schema_versions(keyspace()) -> response().
+-spec describe_schema_versions(destination()) -> response().
 describe_schema_versions(Destination) ->
     route_call(Destination, {describe_schema_versions}, ?POOL_TIMEOUT).
 
 %% @doc Get the cluster_name 
 -spec describe_cluster_name() -> response().
 describe_cluster_name() ->
-    describe_cluster_name(?DEFAULT_KEYSPACE).
+    describe_cluster_name(?DEFAULT_KEYSPACE_OPS_POOL).
 
 %% @doc Get the Thrift API cluster_name
--spec describe_cluster_name(keyspace()) -> response().
+-spec describe_cluster_name(destination()) -> response().
 describe_cluster_name(Destination) ->
     route_call(Destination, {describe_cluster_name}, ?POOL_TIMEOUT).
 
@@ -420,10 +424,10 @@ describe_cluster_name(Destination) ->
 %% @doc Get the list of all the keyspaces
 -spec describe_keyspaces() -> response().
 describe_keyspaces() ->
-    describe_keyspaces(?DEFAULT_KEYSPACE).
+    describe_keyspaces(?DEFAULT_KEYSPACE_OPS_POOL).
 
 %% @doc Get the Thrift API keyspaces
--spec describe_keyspaces(keyspace()) -> response().
+-spec describe_keyspaces(destination()) -> response().
 describe_keyspaces(Destination) ->
     route_call(Destination, {describe_keyspaces}, ?POOL_TIMEOUT).
 
@@ -475,12 +479,19 @@ counter_column(Name, Value) when is_binary(Name),
     #counterColumn{name = Name,
                    value = Value}.
 
--spec column_family_definition(keyspace(), column_family()) -> column_family_definition().
+-spec column_family_definition(destination(), column_family()) -> column_family_definition().
+column_family_definition({_, _, Keyspace} = Destination, ColumnFamily) when is_binary(Keyspace),
+                                                                            is_binary(ColumnFamily) ->
+    column_family_definition(Destination, ColumnFamily, false);
 column_family_definition(Keyspace, ColumnFamily) when is_binary(Keyspace),
                                                       is_binary(ColumnFamily) ->
     column_family_definition(Keyspace, ColumnFamily, false).
 
--spec column_family_definition(keyspace(), column_family(), is_counter_column()) -> column_family_definition().
+-spec column_family_definition(destination(), column_family(), is_counter_column()) -> column_family_definition().
+column_family_definition({_, _, Keyspace}, ColumnFamily, Bool) when is_binary(Keyspace),
+                                                                    is_binary(ColumnFamily),
+                                                                    is_boolean(Bool) ->
+    column_family_definition(Keyspace, ColumnFamily, Bool);
 column_family_definition(Keyspace, ColumnFamily, false) when is_binary(Keyspace),
                                                       is_binary(ColumnFamily) ->
     #cfDef{keyspace = Keyspace,
@@ -494,11 +505,16 @@ column_family_definition(Keyspace, ColumnFamily, true) when is_binary(Keyspace),
            default_validation_class = <<"CounterColumnType">>
           }.
 
--spec keyspace_definition(keyspace()) -> keyspace_definition().
+-spec keyspace_definition(destination()) -> keyspace_definition().
+keyspace_definition({_, _, Keyspace} = Destination) when is_binary(Keyspace) ->
+    keyspace_definition(Destination, 1);
 keyspace_definition(Keyspace) when is_binary(Keyspace) ->
     keyspace_definition(Keyspace, 1).
 
--spec keyspace_definition(keyspace(), replication_factor()) -> keyspace_definition().
+-spec keyspace_definition(destination(), replication_factor()) -> keyspace_definition().
+keyspace_definition({_, _, Keyspace}, ReplicationFactor) when is_binary(Keyspace),
+                                                              is_integer(ReplicationFactor) ->
+    keyspace_definition(Keyspace, ReplicationFactor);
 keyspace_definition(Keyspace, ReplicationFactor) when is_binary(Keyspace),
                                                       is_integer(ReplicationFactor) ->
     #ksDef{name=Keyspace, 
@@ -525,27 +541,45 @@ key_range(StartKey, EndKey) ->
 %% gen_server Function Definitions
 %% ------------------------------------------------------------------
 
-init([ConnectionOptions0]) ->
-    {Keyspace1, ConnectionOptions2} = 
-    case lists:keytake(keyspace, 1, ConnectionOptions0) of
-        {value, {keyspace, Keyspace0}, ConnectionOptions1} -> 
-            {Keyspace0, ConnectionOptions1};
+init([ConnectionOptions]) ->
+    {Keyspace1, ConnectionOptions1} = 
+    case lists:keytake(keyspace, 1, ConnectionOptions) of
+        {value, {keyspace, Keyspace0}, Options0} -> 
+            {Keyspace0, Options0};
         false ->
-            {?DEFAULT_KEYSPACE, ConnectionOptions0}
+            {?DEFAULT_KEYSPACE_OPS_POOL, ConnectionOptions}
     end,
-    {SetKeyspace, ConnectionOptions4} = 
-    case lists:keytake(set_keyspace, 1, ConnectionOptions2) of
-        {value, {set_keyspace, Bool}, ConnectionOptions3} -> 
-            {Bool, ConnectionOptions3};
+    {SetKeyspace, ConnectionOptions2} = 
+    case lists:keytake(set_keyspace, 1, ConnectionOptions1) of
+        {value, {set_keyspace, Bool}, Options1} -> 
+            {Bool, Options1};
         false ->
             % By default, set the keyspace
-            {true, ConnectionOptions2}
+            {true, ConnectionOptions1}
+    end,
+    {RetryInterval, ConnectionOptions3} = 
+    case lists:keytake(retry_interval, 1, ConnectionOptions2) of
+        {value, {retry_interval, Interval}, Options2} ->
+            {Interval, Options2};
+        false ->
+            % By default, set the keyspace
+            {0, ConnectionOptions2}
+    end,
+    {RetryAmount, ConnectionOptions4} =
+    case lists:keytake(retry_amount, 1, ConnectionOptions3) of
+        {value, {retry_amount, Amount}, Options3} ->
+            {Amount, Options3};
+        false ->
+            % By default, set the keyspace
+            {1, ConnectionOptions3}
     end,
     Connection0 = connection(ConnectionOptions4),
     State0 = #state{keyspace = Keyspace1, 
                     set_keyspace = SetKeyspace,
                     connection_options = ConnectionOptions4,
-                    connection = Connection0},
+                    connection = Connection0,
+                    retries_left = RetryAmount,
+                    retry_interval = RetryInterval},
     {Connection1, _Response} = 
     case SetKeyspace of 
         true ->
@@ -600,7 +634,7 @@ connection(ConnectionOptions) ->
     ThriftOptions2 = lists:keydelete(framed, 1, ThriftOptions1),
     ThriftOptions3 = [{framed, true} | ThriftOptions2],
     try
-        {ok, Connection} = thrift_client_util:new(ThriftHost, ThriftPort, cassandra_thrift, ThriftOptions3),
+        {ok, Connection} = thrift_client_util:new(ThriftHost, ThriftPort, erlang_cassandra_thrift, ThriftOptions3),
         Connection
     catch
         _:_ -> undefined
@@ -621,36 +655,70 @@ request({F, A1, A2, A3}) ->
 request({F, A1, A2, A3, A4}) ->
     {F, [A1, A2, A3, A4]}.
 
-
 %% @doc Process the request over thrift
+%%      In case the network blipped and the thrift connection vanishes,
+%%      this will retry the request (w/ a new thrift connection)
+%%      before choking
 -spec process_request(connection(), request(), #state{}) -> {connection(), response()}.
-process_request(undefined, {Function, Args}, State = #state{connection_options = ConnectionOptions}) ->
+process_request(undefined, Request, State = #state{connection_options = ConnectionOptions}) ->
     Connection = connection(ConnectionOptions),
-    do_request(Connection, {Function, Args}, State#state{connection = Connection});
-process_request(Connection, {Function, Args}, State) ->
-    do_request(Connection, {Function, Args}, State).
+    process_request(Connection, Request, State);
+process_request(Connection, Request, State) ->
+    case do_request(Connection, Request, State) of
+        {error, closed, NewState} ->
+            error_or_retry({error, closed}, Request, NewState);
+        {error, econnrefused, NewState} ->
+            error_or_retry({error, econnrefused}, Request, NewState);
+        {Connection1, Response} ->
+            {Connection1, Response}
+    end.
 
--spec do_request(connection(), request(), #state{}) -> {connection(), response()}.
-do_request(Connection, {Function, Args}, _State) ->
+-spec increase_reconnect_interval(state()) -> state().
+increase_reconnect_interval(#state{retry_interval = Interval} = State) ->
+    if Interval < ?MAX_RECONNECT_INTERVAL ->
+            NewInterval = min(Interval + Interval, ?MAX_RECONNECT_INTERVAL),
+            State#state{retry_interval = NewInterval};
+       true ->
+            State
+    end.
+
+-spec update_reconnect_state(state()) -> state().
+update_reconnect_state(State) ->
+    State1 = increase_reconnect_interval(State),
+    State2 = decrease_retries_left(State1),
+    State2.
+
+-spec decrease_retries_left(state()) -> state().
+decrease_retries_left(#state{retries_left = N} = State) ->
+    State#state{retries_left = N - 1}.
+
+-spec error_or_retry({error, atom()}, request(), state()) ->
+                            {error, atom()} | {connection(), response()}.
+error_or_retry({error, Reason},
+               Request, #state{retries_left = N, retry_interval = W} = State)
+  when N > 0 andalso W >= 0
+       andalso (Reason =:= closed orelse Reason =:= econnrefused) ->
+    timer:sleep(W),
+    ShorterRetryState = update_reconnect_state(State),
+    process_request(undefined, Request, ShorterRetryState);
+error_or_retry(Error, _Request, _State) ->
+    Error.
+
+do_request(Connection, {Function, Args}, State) ->
     try thrift_client:call(Connection, Function, Args) of
         {Connection1, Response = {ok, _}} ->
             {Connection1, Response};
         {Connection1, Response = {error, _}} ->
             {Connection1, Response}
     catch
-        Exception:Reason ->
-            case {Exception, Reason} of
-                {throw, {Connection1, Response = {exception, _}}} ->
-                    {Connection1, Response};
-                % Thrift client closes the connection
-                {error, {case_clause,{error, closed}}} ->
-                    {undefined, {error, badarg}};
-                {error, {case_clause,{error, econnrefused}}} ->
-                    {undefined, {error, econnrefused}};
-                {error, badarg} ->
-                    {Connection, {error, badarg}}
-
-            end
+        throw:{Connection1, Response = {exception, _}} ->
+            {Connection1, Response};
+        error:badarg ->
+            {Connection, {error, badarg}};
+        error:{case_clause, {error, closed}} ->
+            {error, closed, State};
+        error:{case_clause, {error, econnrefused}} ->
+            {error, econnrefused, State}
     end.
 
 %% @doc Send the request to the gen_server
@@ -693,12 +761,38 @@ pool_call(FqServerRef, Command, Timeout) ->
                 end) end,
     try
         TransactionFun()
-    % If the pool doesnt' exist, the keyspace has not been set before
+        % If the pool doesnt' exist, the keyspace has not been set before
+        % Check to make sure that the keyspace exists before starting the 
+        % pool
     catch
-        exit:{noproc, _} ->
-            start_pool(FqServerRef),
-            TransactionFun()
+        exit:{noproc, _Other} ->
+            case keyspace_exists(FqServerRef) of
+                true ->
+                    start_pool(FqServerRef),
+                    TransactionFun();
+                false -> 
+                    {_, _, Keyspace} = FqServerRef,
+                    {error, {?INVALID_KEYSPACE, Keyspace}}
+            end
     end.
+
+keyspace_exists(Destination) ->
+    Keyspace = keyspace_from_destination(Destination),
+    FqDefaultServerRef = fq_default_server_ref(Destination),
+    % Make sure that the default pool exists. Should usually do so, 
+    % but if alternate thrift hosts/ports are specified, need
+    % to make sure that the correct pool is used
+    start_pool(FqDefaultServerRef),
+    case safe_describe_keyspace(FqDefaultServerRef, Keyspace) of
+        {ok, _} -> true;
+        _Other -> 
+            false
+    end.
+
+% Don't want to describe the default keyspace - it doesn't exist
+safe_describe_keyspace(_, ?DEFAULT_KEYSPACE_OPS_POOL) -> {ok, ok};
+safe_describe_keyspace(FqDefaultServerRef, Keyspace) ->
+    describe_keyspace(FqDefaultServerRef, Keyspace).
 
 %% @doc Fully qualify a server ref w/ a thrift host/port
 -spec fq_server_ref(destination()) -> fq_server_ref().
@@ -706,6 +800,14 @@ fq_server_ref({Host, Port, Name}) when is_list(Name) -> {Host, Port, list_to_bin
 fq_server_ref({Host, Port, Name}) when is_binary(Name) -> {Host, Port, Name};
 fq_server_ref(Destination) when is_list(Destination) -> {undefined, undefined, list_to_binary(Destination)};
 fq_server_ref(Destination) when is_binary(Destination) -> {undefined, undefined, Destination}.
+
+%% @doc Fully qualify the default server ref w/ a thrift host/port
+-spec fq_default_server_ref(destination()) -> fq_server_ref().
+fq_default_server_ref({Host, Port, _}) -> {Host, Port, ?DEFAULT_KEYSPACE_OPS_POOL}.
+
+%% @doc Get the keyspace from a Destination
+-spec keyspace_from_destination(destination()) -> keyspace().
+keyspace_from_destination({_, _, Keyspace}) -> Keyspace.
 
 %% If thrift host is passed in, use it
 binary_host(Host) when is_list(Host) -> list_to_binary(Host);

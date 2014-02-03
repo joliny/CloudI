@@ -44,7 +44,7 @@
 %%%
 %%% @author Michael Truog <mjtruog [at] gmail (dot) com>
 %%% @copyright 2009-2013 Michael Truog
-%%% @version 1.3.0 {@date} {@time}
+%%% @version 1.3.1 {@date} {@time}
 %%%------------------------------------------------------------------------
 
 -module(cloudi_core_app).
@@ -101,7 +101,17 @@ test() ->
 start(_, _) ->
     application:set_env(cloudi_core, mac_address, cloudi_x_uuid:mac_address()),
     cloudi_x_quickrand:seed(),
-    {ok, PathOrData} = application:get_env(configuration),
+    PathOrData = case application:get_env(configuration) of
+        {ok, C} ->
+            C;
+        undefined ->
+            % default configuration
+            % (it is better to not use this, to have everything fail-fast)
+            [{acl, []},
+             {services, []},
+             {nodes, []},
+             {logging, [{file, "cloudi.log"}]}]
+    end,
     case cloudi_configuration:load(PathOrData) of
         {ok, Config} ->
             cloudi_core_sup:start_link(Config);

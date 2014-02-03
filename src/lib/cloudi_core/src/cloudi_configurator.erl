@@ -9,7 +9,7 @@
 %%%
 %%% BSD LICENSE
 %%% 
-%%% Copyright (c) 2011-2013, Michael Truog <mjtruog at gmail dot com>
+%%% Copyright (c) 2011-2014, Michael Truog <mjtruog at gmail dot com>
 %%% All rights reserved.
 %%% 
 %%% Redistribution and use in source and binary forms, with or without
@@ -44,8 +44,8 @@
 %%% DAMAGE.
 %%%
 %%% @author Michael Truog <mjtruog [at] gmail (dot) com>
-%%% @copyright 2011-2013 Michael Truog
-%%% @version 1.3.0 {@date} {@time}
+%%% @copyright 2011-2014 Michael Truog
+%%% @version 1.3.1 {@date} {@time}
 %%%------------------------------------------------------------------------
 
 -module(cloudi_configurator).
@@ -58,6 +58,7 @@
          configure/0,
          acl_add/2,
          acl_remove/2,
+         service_subscriptions/2,
          services_add/2,
          services_remove/2,
          services_restart/2,
@@ -105,6 +106,11 @@ acl_add(L, Timeout) ->
 acl_remove(L, Timeout) ->
     ?CATCH_EXIT(gen_server:call(?MODULE,
                                 {acl_remove, L,
+                                 timeout_decr(Timeout)}, Timeout)).
+
+service_subscriptions(ServiceId, Timeout) ->
+    ?CATCH_EXIT(gen_server:call(?MODULE,
+                                {service_subscriptions, ServiceId,
                                  timeout_decr(Timeout)}, Timeout)).
 
 services_add(L, Timeout) ->
@@ -169,9 +175,12 @@ service_start(#config_service_internal{
             Error
     end;
 
-service_start(#config_service_external{count_process = Count} = Service,
+service_start(#config_service_external{count_process = Count,
+                                       count_thread = CountThread} = Service,
               Timeout) ->
-    service_start_external(concurrency(Count), Service, timeout_decr(Timeout)).
+    NewCountThread = concurrency(CountThread),
+    service_start_external(concurrency(Count), Service,
+                           NewCountThread, timeout_decr(Timeout)).
 
 service_stop(#config_service_internal{} = Service, Remove, Timeout)
     when is_boolean(Remove) ->
@@ -193,7 +202,7 @@ concurrency(I)
     when is_float(I) ->
     if
         I > 1.0 ->
-            erlang:round((I * erlang:system_info(schedulers)) + 0.5);
+            cloudi_math:floor(I * erlang:system_info(schedulers));
         I > 0.0, I < 1.0 ->
             erlang:max(1, erlang:round(I * erlang:system_info(schedulers)));
         I == 1.0 ->
@@ -227,6 +236,16 @@ handle_call({acl_remove, L, _}, _,
     case cloudi_configuration:acl_remove(L, Config) of
         {ok, NewConfig} ->
             {reply, ok, State#state{configuration = NewConfig}};
+        {error, _} = Error ->
+            {reply, Error, State}
+    end;
+
+handle_call({service_subscriptions, ServiceId, Timeout}, _, State) ->
+    case cloudi_services_monitor:pids(ServiceId, Timeout) of
+        {ok, PidList} ->
+            L = [sets:from_list(cloudi_x_cpg:which_groups(Pid, Timeout))
+                 || Pid <- PidList],
+            {reply, {ok, lists:sort(sets:to_list(sets:union(L)))}, State};
         {error, _} = Error ->
             {reply, Error, State}
     end;
@@ -360,6 +379,22 @@ configure_service([Service | Services], Configured, Timeout) ->
             Error
     end.
 
+service_start_find_internal(#config_service_internal{
+                                module = Module,
+                                options = #config_service_options{
+                                    automatic_loading = false}} = Service,
+                            _Timeout) ->
+    if
+        is_atom(Module) ->
+            case code:is_loaded(Module) of
+                false ->
+                    {error, {not_loaded, Module}};
+                _ ->
+                    {ok, Service}
+            end;
+        true ->
+            {error, {invalid_loaded_module, Module}}
+    end;
 service_start_find_internal(#config_service_internal{
                                 module = FilePath} = Service, Timeout)
     when is_list(FilePath) ->
@@ -500,8 +535,14 @@ service_start_find_internal_script(ScriptPath, Service)
             Error
     end.
 
-service_stop_remove_internal(#config_service_internal{module = Module,
-                                                      file_path = FilePath},
+service_stop_remove_internal(#config_service_internal{
+                                options = #config_service_options{
+                                    automatic_loading = false}},
+                             _Timeout) ->
+    ok;
+service_stop_remove_internal(#config_service_internal{
+                                 module = Module,
+                                 file_path = FilePath},
                              Timeout)
     when is_atom(Module), is_list(FilePath) ->
     case filename:extension(FilePath) of
@@ -510,16 +551,20 @@ service_stop_remove_internal(#config_service_internal{module = Module,
         ".beam" ->
             cloudi_x_reltool_util:module_purged(Module, Timeout);
         ".app" ->
-            cloudi_x_reltool_util:application_remove(Module, Timeout);
+            cloudi_x_reltool_util:application_remove(Module, Timeout,
+                                                     [cloudi_core]);
         ".script" ->
-            cloudi_x_reltool_util:script_remove(FilePath, Timeout)
+            cloudi_x_reltool_util:script_remove(FilePath, Timeout,
+                                                [cloudi_core])
     end;
-service_stop_remove_internal(#config_service_internal{module = Module},
+service_stop_remove_internal(#config_service_internal{
+                                 module = Module},
                              Timeout)
     when is_atom(Module) ->
     case cloudi_x_reltool_util:application_running(Module, Timeout) of
         {ok, _} ->
-            cloudi_x_reltool_util:application_remove(Module, Timeout);
+            cloudi_x_reltool_util:application_remove(Module, Timeout,
+                                                     [cloudi_core]);
         {error, {not_found, Module}} ->
             cloudi_x_reltool_util:module_purged(Module, Timeout);
         {error, _} = Error ->
@@ -545,23 +590,21 @@ service_start_internal(Count0,
                            uuid = ID} = Service, Timeout) ->
     Count1 = Count0 - 1,
     case cloudi_services_monitor:monitor(cloudi_spawn, start_internal,
-                                         [Count1,
-                                          Module, Args, TimeoutInit,
+                                         [Module, Args, TimeoutInit,
                                           Prefix, TimeoutAsync, TimeoutSync,
                                           DestRefresh, DestListDeny,
                                           DestListAllow, Options, ID],
-                                         MaxR, MaxT, ID, Timeout) of
+                                         Count1, 1, MaxR, MaxT, ID, Timeout) of
         ok ->
             service_start_internal(Count1, Service, Timeout);
         {error, _} = Error ->
             Error
     end.
 
-service_start_external(0, Service, _) ->
+service_start_external(0, Service, _, _) ->
     {ok, Service};
 service_start_external(Count0,
                        #config_service_external{
-                           count_thread = CountThread,
                            file_path = FilePath,
                            args = Args,
                            env = Env,
@@ -577,17 +620,19 @@ service_start_external(Count0,
                            options = Options,
                            max_r = MaxR,
                            max_t = MaxT,
-                           uuid = ID} = Service, Timeout) ->
+                           uuid = ID} = Service, CountThread, Timeout) ->
+    Count1 = Count0 - 1,
     case cloudi_services_monitor:monitor(cloudi_spawn, start_external,
-                                         [concurrency(CountThread),
+                                         [CountThread,
                                           FilePath, Args, Env,
                                           Protocol, BufferSize, TimeoutInit,
                                           Prefix, TimeoutAsync, TimeoutSync,
                                           DestRefresh, DestListDeny,
                                           DestListAllow, Options, ID],
+                                         Count1, CountThread,
                                          MaxR, MaxT, ID, Timeout) of
         ok ->
-            service_start_external(Count0 - 1, Service, Timeout);
+            service_start_external(Count1, Service, CountThread, Timeout);
         {error, _} = Error ->
             Error
     end.

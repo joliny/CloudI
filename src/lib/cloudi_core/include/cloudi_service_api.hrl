@@ -53,7 +53,7 @@
         timeout_sync       :: cloudi_service_api:timeout_milliseconds(),
         dest_list_deny     :: cloudi_service_api:dest_list(),
         dest_list_allow    :: cloudi_service_api:dest_list(),
-        count_process      :: pos_integer(),
+        count_process      :: pos_integer() | float(),
         max_r              :: non_neg_integer(),
         max_t              :: cloudi_service_api:seconds(),
         options            :: cloudi_service_api:service_options_internal()
@@ -74,8 +74,8 @@
         timeout_sync       :: cloudi_service_api:timeout_milliseconds(),
         dest_list_deny     :: cloudi_service_api:dest_list(),
         dest_list_allow    :: cloudi_service_api:dest_list(),
-        count_process      :: pos_integer(),
-        count_thread       :: pos_integer(),
+        count_process      :: pos_integer() | float(),
+        count_thread       :: pos_integer() | float(),
         max_r              :: non_neg_integer(),
         max_t              :: cloudi_service_api:seconds(),
         options            :: cloudi_service_api:service_options_external()

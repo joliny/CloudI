@@ -2,7 +2,7 @@
 % ex: set ft=erlang fenc=utf-8 sts=4 ts=4 sw=4 et:
 
 {application, cloudi_service_http_elli, 
-  [{description, "CloudI Services Internal Integration"},
+  [{description, "elli HTTP CloudI Service"},
    {vsn, "@VERSION@"},
    {modules, [
         cloudi_http_elli_handler,
@@ -13,7 +13,8 @@
         cloudi_x_elli
         ]},
    {applications, [
-        %cloudi_core, % makes relx break
+        cloudi_core,
+        cloudi_x_cowlib,
         cloudi_x_trie,
         cloudi_x_uuid,
         stdlib,

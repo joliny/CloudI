@@ -21,6 +21,7 @@ SCOPE_ARGS = -s $(SCOPE_EXTERNAL) -p cloudi -b _original \
      -d $(top_srcdir)/lib/cloudi_service_http_elli/src \
      -d $(top_srcdir)/lib/cloudi_service_map_reduce/src \
      -d $(top_srcdir)/lib/cloudi_service_quorum/src \
+     -d $(top_srcdir)/lib/cloudi_service_router/src \
      -d $(top_srcdir)/lib/cloudi_service_tcp/src \
      -d $(top_srcdir)/lib/cloudi_service_timers/src \
      -d $(top_srcdir)/lib/cloudi_service_udp/src \
@@ -40,6 +41,8 @@ SCOPE_ARGS = -s $(SCOPE_EXTERNAL) -p cloudi -b _original \
      -d $(top_srcdir)/external/nodefinder/nodefinder/src \
      -d $(top_srcdir)/external/cowboy/src \
      -d $(top_srcdir)/external/cowboy/test \
+     -d $(top_srcdir)/external/cowlib/src \
+     -d $(top_srcdir)/external/cowlib/test \
      -d $(top_srcdir)/external/elli/src \
      -d $(top_srcdir)/external/elli/test \
      -d $(top_srcdir)/external/dynamic_compile/src \
@@ -50,7 +53,10 @@ SCOPE_ARGS = -s $(SCOPE_EXTERNAL) -p cloudi -b _original \
      -d $(top_srcdir)/external/erlang_cassandra/src \
      -d $(top_srcdir)/external/erlasticsearch/src \
      -d $(top_srcdir)/external/etokyotyrant/src \
+     -d $(top_srcdir)/external/goldrush/src \
      -d $(top_srcdir)/external/jsx/src \
+     -d $(top_srcdir)/external/lager/src \
+     -d $(top_srcdir)/external/lager/test \
      -d $(top_srcdir)/external/poolboy/src \
      -d $(top_srcdir)/external/poolboy/test \
      -d $(top_srcdir)/external/ranch/src \
@@ -126,6 +132,7 @@ rebar-directories-compile:
 	$(MKDIR_P) lib/cloudi_service_http_elli/ebin
 	$(MKDIR_P) lib/cloudi_service_map_reduce/ebin
 	$(MKDIR_P) lib/cloudi_service_quorum/ebin
+	$(MKDIR_P) lib/cloudi_service_router/ebin
 	$(MKDIR_P) lib/cloudi_service_tcp/ebin
 	$(MKDIR_P) lib/cloudi_service_timers/ebin
 	$(MKDIR_P) lib/cloudi_service_udp/ebin
@@ -138,10 +145,13 @@ rebar-directories-compile:
 	$(MKDIR_P) lib/trie/ebin
 	$(MKDIR_P) lib/reltool_util/ebin
 	$(MKDIR_P) lib/key2value/ebin
+	$(MKDIR_P) lib/service/ebin
 	$(MKDIR_P) external/nodefinder/combonodefinder/ebin
 	$(MKDIR_P) external/nodefinder/ec2nodefinder/ebin
 	$(MKDIR_P) external/nodefinder/nodefinder/ebin
+	$(MKDIR_P) external/lager/ebin
 	$(MKDIR_P) external/jsx/ebin
+	$(MKDIR_P) external/goldrush/ebin
 	$(MKDIR_P) external/etokyotyrant/ebin
 	$(MKDIR_P) external/poolboy/ebin
 	$(MKDIR_P) external/thrift/ebin
@@ -152,6 +162,7 @@ rebar-directories-compile:
 	$(MKDIR_P) external/ememcached/ebin
 	$(MKDIR_P) external/ecouchdb/ebin
 	$(MKDIR_P) external/cowboy/ebin
+	$(MKDIR_P) external/cowlib/ebin
 	$(MKDIR_P) external/ranch/ebin
 	$(MKDIR_P) external/elli/ebin
 	$(MKDIR_P) external/dynamic_compile/ebin
@@ -200,6 +211,9 @@ rebar-directories-compile:
 	(cd $(top_srcdir)/lib/cloudi_service_quorum/src && \
         test ! -e cloudi_service_quorum.app.src && \
         $(LN_S) $(abs_top_builddir)/lib/cloudi_service_quorum/src/cloudi_service_quorum.app.src || exit 0)
+	(cd $(top_srcdir)/lib/cloudi_service_router/src && \
+        test ! -e cloudi_service_router.app.src && \
+        $(LN_S) $(abs_top_builddir)/lib/cloudi_service_router/src/cloudi_service_router.app.src || exit 0)
 	(cd $(top_srcdir)/lib/cloudi_service_tcp/src && \
         test ! -e cloudi_service_tcp.app.src && \
         $(LN_S) $(abs_top_builddir)/lib/cloudi_service_tcp/src/cloudi_service_tcp.app.src || exit 0)
@@ -236,6 +250,9 @@ rebar-directories-compile:
 	(cd $(top_srcdir)/lib/key2value/src && \
         test ! -e $(SCOPE_EXTERNAL)key2value.app.src && \
         $(LN_S) $(abs_top_builddir)/lib/key2value/src/$(SCOPE_EXTERNAL)key2value.app.src || exit 0)
+	(cd $(top_srcdir)/lib/service/src && \
+        test ! -e service.app.src && \
+        $(LN_S) $(abs_top_builddir)/lib/service/src/service.app.src || exit 0)
 	(cd $(top_srcdir)/lib/cloudi_core && \
         test ! -e ebin && \
         $(LN_S) $(abs_top_builddir)/lib/cloudi_core/ebin || exit 0)
@@ -281,6 +298,9 @@ rebar-directories-compile:
 	(cd $(top_srcdir)/lib/cloudi_service_quorum && \
         test ! -e ebin && \
         $(LN_S) $(abs_top_builddir)/lib/cloudi_service_quorum/ebin || exit 0)
+	(cd $(top_srcdir)/lib/cloudi_service_router && \
+        test ! -e ebin && \
+        $(LN_S) $(abs_top_builddir)/lib/cloudi_service_router/ebin || exit 0)
 	(cd $(top_srcdir)/lib/cloudi_service_tcp && \
         test ! -e ebin && \
         $(LN_S) $(abs_top_builddir)/lib/cloudi_service_tcp/ebin || exit 0)
@@ -317,12 +337,15 @@ rebar-directories-compile:
 	(cd $(top_srcdir)/lib/key2value && \
         test ! -e ebin && \
         $(LN_S) $(abs_top_builddir)/lib/key2value/ebin || exit 0)
+	(cd $(top_srcdir)/lib/service && \
+        test ! -e ebin && \
+        $(LN_S) $(abs_top_builddir)/lib/service/ebin || exit 0)
 	(if test "x$(ZEROMQ_VERSION_MAJOR)" != "x"; then : ; \
-       $(MKDIR_P) external/zeromq/v$(ZEROMQ_VERSION_MAJOR) && \
-       cd $(top_builddir)/external/zeromq/v$(ZEROMQ_VERSION_MAJOR) && \
-        test ! -e erlzmq && \
-        $(LN_S) $(abs_top_srcdir)/external/zeromq/v$(ZEROMQ_VERSION_MAJOR)/erlzmq || exit 0; \
-   fi)
+        $(MKDIR_P) external/zeromq/v$(ZEROMQ_VERSION_MAJOR) && \
+        cd $(top_builddir)/external/zeromq/v$(ZEROMQ_VERSION_MAJOR) && \
+            test ! -e erlzmq && \
+            $(LN_S) $(abs_top_srcdir)/external/zeromq/v$(ZEROMQ_VERSION_MAJOR)/erlzmq || exit 0; \
+     fi)
 	(cd $(top_srcdir)/external/nodefinder/nodefinder && \
         test ! -e ebin && $(LN_S) \
         $(abs_top_builddir)/external/nodefinder/nodefinder/ebin || \
@@ -335,9 +358,15 @@ rebar-directories-compile:
         test ! -e ebin && $(LN_S) \
         $(abs_top_builddir)/external/nodefinder/combonodefinder/ebin || \
         exit 0)
+	(cd $(top_srcdir)/external/lager && \
+        test ! -e ebin && \
+        $(LN_S) $(abs_top_builddir)/external/lager/ebin || exit 0)
 	(cd $(top_srcdir)/external/jsx && \
         test ! -e ebin && \
         $(LN_S) $(abs_top_builddir)/external/jsx/ebin || exit 0)
+	(cd $(top_srcdir)/external/goldrush && \
+        test ! -e ebin && \
+        $(LN_S) $(abs_top_builddir)/external/goldrush/ebin || exit 0)
 	(cd $(top_srcdir)/external/etokyotyrant && \
         test ! -e ebin && \
         $(LN_S) $(abs_top_builddir)/external/etokyotyrant/ebin || exit 0)
@@ -368,6 +397,9 @@ rebar-directories-compile:
 	(cd $(top_srcdir)/external/cowboy && \
         test ! -e ebin && \
         $(LN_S) $(abs_top_builddir)/external/cowboy/ebin || exit 0)
+	(cd $(top_srcdir)/external/cowlib && \
+        test ! -e ebin && \
+        $(LN_S) $(abs_top_builddir)/external/cowlib/ebin || exit 0)
 	(cd $(top_srcdir)/external/ranch && \
         test ! -e ebin && \
         $(LN_S) $(abs_top_builddir)/external/ranch/ebin || exit 0)
@@ -396,7 +428,11 @@ rebar-directories-compile:
         test ! -e include && \
         $(LN_S) $(abs_top_srcdir)/lib/cloudi_core/include || exit 0)
 
-erlang-applications-scope-add:
+erlang-applications-scope-add: scoped
+
+scoped: $(top_srcdir)/external/README.markdown
+	rm -f $@ ; echo > $@
+	$(ESCRIPT) $(top_srcdir)/lib/reltool_util/scope $(SCOPE_ARGS) -u
 	$(ESCRIPT) $(top_srcdir)/lib/reltool_util/scope $(SCOPE_ARGS)
 
 rebar-compile: erlang-applications-scope-add \
@@ -414,51 +450,104 @@ rebar-clean:
      exit 0)
 
 rebar-directories-clean: rebar-clean
-	rmdir $(top_builddir)/lib/cloudi_core/ebin \
-          $(top_builddir)/lib/cloudi_service_api_requests/ebin \
-          $(top_builddir)/lib/cloudi_service_db/ebin \
-          $(top_builddir)/lib/cloudi_service_db_cassandra/ebin \
-          $(top_builddir)/lib/cloudi_service_db_couchdb/ebin \
-          $(top_builddir)/lib/cloudi_service_db_elasticsearch/ebin \
-          $(top_builddir)/lib/cloudi_service_db_memcached/ebin \
-          $(top_builddir)/lib/cloudi_service_db_mysql/ebin \
-          $(top_builddir)/lib/cloudi_service_db_pgsql/ebin \
-          $(top_builddir)/lib/cloudi_service_db_tokyotyrant/ebin \
-          $(top_builddir)/lib/cloudi_service_filesystem/ebin \
-          $(top_builddir)/lib/cloudi_service_http_cowboy/ebin \
-          $(top_builddir)/lib/cloudi_service_http_elli/ebin \
-          $(top_builddir)/lib/cloudi_service_map_reduce/ebin \
-          $(top_builddir)/lib/cloudi_service_quorum/ebin \
-          $(top_builddir)/lib/cloudi_service_tcp/ebin \
-          $(top_builddir)/lib/cloudi_service_timers/ebin \
-          $(top_builddir)/lib/cloudi_service_udp/ebin \
-          $(top_builddir)/lib/cloudi_service_work_manager/ebin \
-          $(top_builddir)/lib/cloudi_service_zeromq/ebin \
-          $(top_builddir)/lib/pqueue/ebin \
-          $(top_builddir)/lib/quickrand/ebin \
-          $(top_builddir)/lib/cpg/ebin \
-          $(top_builddir)/lib/uuid/ebin \
-          $(top_builddir)/lib/trie/ebin \
-          $(top_builddir)/lib/reltool_util/ebin \
-          $(top_builddir)/lib/key2value/ebin \
-          $(top_builddir)/external/nodefinder/nodefinder/ebin \
-          $(top_builddir)/external/nodefinder/ec2nodefinder/ebin \
-          $(top_builddir)/external/nodefinder/combonodefinder/ebin \
-          $(top_builddir)/external/jsx/ebin \
-          $(top_builddir)/external/etokyotyrant/ebin \
-          $(top_builddir)/external/poolboy/ebin \
-          $(top_builddir)/external/thrift/ebin \
-          $(top_builddir)/external/erlasticsearch/ebin \
-          $(top_builddir)/external/erlang_cassandra/ebin \
-          $(top_builddir)/external/epgsql/ebin \
-          $(top_builddir)/external/emysql/ebin \
-          $(top_builddir)/external/ememcached/ebin \
-          $(top_builddir)/external/ecouchdb/ebin \
-          $(top_builddir)/external/cowboy/ebin \
-          $(top_builddir)/external/ranch/ebin \
-          $(top_builddir)/external/elli/ebin \
-          $(top_builddir)/external/dynamic_compile/ebin \
-          || exit 0
+	rmdir $(top_builddir)/lib/cloudi_core/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_core/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_api_requests/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_api_requests/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_db/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_db/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_db_cassandra/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_db_cassandra/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_db_couchdb/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_db_couchdb/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_db_elasticsearch/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_db_elasticsearch/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_db_memcached/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_db_memcached/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_db_mysql/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_db_mysql/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_db_pgsql/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_db_pgsql/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_db_tokyotyrant/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_db_tokyotyrant/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_filesystem/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_filesystem/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_http_cowboy/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_http_cowboy/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_http_elli/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_http_elli/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_map_reduce/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_map_reduce/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_quorum/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_quorum/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_router/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_router/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_tcp/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_tcp/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_timers/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_timers/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_udp/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_udp/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_work_manager/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_work_manager/ebin
+	rmdir $(top_builddir)/lib/cloudi_service_zeromq/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cloudi_service_zeromq/ebin
+	rmdir $(top_builddir)/lib/pqueue/ebin || exit 0
+	rm -f $(top_srcdir)/lib/pqueue/ebin
+	rmdir $(top_builddir)/lib/quickrand/ebin || exit 0
+	rm -f $(top_srcdir)/lib/quickrand/ebin
+	rmdir $(top_builddir)/lib/cpg/ebin || exit 0
+	rm -f $(top_srcdir)/lib/cpg/ebin
+	rmdir $(top_builddir)/lib/uuid/ebin || exit 0
+	rm -f $(top_srcdir)/lib/uuid/ebin
+	rmdir $(top_builddir)/lib/trie/ebin || exit 0
+	rm -f $(top_srcdir)/lib/trie/ebin
+	rmdir $(top_builddir)/lib/reltool_util/ebin || exit 0
+	rm -f $(top_srcdir)/lib/reltool_util/ebin
+	rmdir $(top_builddir)/lib/key2value/ebin || exit 0
+	rm -f $(top_srcdir)/lib/key2value/ebin
+	rmdir $(top_builddir)/lib/service/ebin || exit 0
+	rm -f $(top_srcdir)/lib/service/ebin
+	rmdir $(top_builddir)/external/nodefinder/nodefinder/ebin || exit 0
+	rm -f $(top_srcdir)/external/nodefinder/nodefinder/ebin
+	rmdir $(top_builddir)/external/nodefinder/ec2nodefinder/ebin || exit 0
+	rm -f $(top_srcdir)/external/nodefinder/ec2nodefinder/ebin
+	rmdir $(top_builddir)/external/nodefinder/combonodefinder/ebin || exit 0
+	rm -f $(top_srcdir)/external/nodefinder/combonodefinder/ebin
+	rmdir $(top_builddir)/external/lager/ebin || exit 0
+	rm -f $(top_srcdir)/external/lager/ebin
+	rmdir $(top_builddir)/external/jsx/ebin || exit 0
+	rm -f $(top_srcdir)/external/jsx/ebin
+	rmdir $(top_builddir)/external/goldrush/ebin || exit 0
+	rm -f $(top_srcdir)/external/goldrush/ebin
+	rmdir $(top_builddir)/external/etokyotyrant/ebin || exit 0
+	rm -f $(top_srcdir)/external/etokyotyrant/ebin
+	rmdir $(top_builddir)/external/poolboy/ebin || exit 0
+	rm -f $(top_srcdir)/external/poolboy/ebin
+	rmdir $(top_builddir)/external/thrift/ebin || exit 0
+	rm -f $(top_srcdir)/external/thrift/ebin
+	rmdir $(top_builddir)/external/erlasticsearch/ebin || exit 0
+	rm -f $(top_srcdir)/external/erlasticsearch/ebin
+	rmdir $(top_builddir)/external/erlang_cassandra/ebin || exit 0
+	rm -f $(top_srcdir)/external/erlang_cassandra/ebin
+	rmdir $(top_builddir)/external/epgsql/ebin || exit 0
+	rm -f $(top_srcdir)/external/epgsql/ebin
+	rmdir $(top_builddir)/external/emysql/ebin || exit 0
+	rm -f $(top_srcdir)/external/emysql/ebin
+	rmdir $(top_builddir)/external/ememcached/ebin || exit 0
+	rm -f $(top_srcdir)/external/ememcached/ebin
+	rmdir $(top_builddir)/external/ecouchdb/ebin || exit 0
+	rm -f $(top_srcdir)/external/ecouchdb/ebin
+	rmdir $(top_builddir)/external/cowboy/ebin || exit 0
+	rm -f $(top_srcdir)/external/cowboy/ebin
+	rmdir $(top_builddir)/external/cowlib/ebin || exit 0
+	rm -f $(top_srcdir)/external/cowlib/ebin
+	rmdir $(top_builddir)/external/ranch/ebin || exit 0
+	rm -f $(top_srcdir)/external/ranch/ebin
+	rmdir $(top_builddir)/external/elli/ebin || exit 0
+	rm -f $(top_srcdir)/external/elli/ebin
+	rmdir $(top_builddir)/external/dynamic_compile/ebin || exit 0
+	rm -f $(top_srcdir)/external/dynamic_compile/ebin
 	(if test "x$(ZEROMQ_VERSION_MAJOR)" != "x"; then : ; \
        test -d external/zeromq/v$(ZEROMQ_VERSION_MAJOR) && \
        rm -f $(top_builddir)/external/zeromq/v$(ZEROMQ_VERSION_MAJOR)/erlzmq \
@@ -482,50 +571,6 @@ rebar-directories-clean: rebar-clean
 	(test -L $(top_builddir)/lib/cloudi_core/include && \
 	 rm $(top_builddir)/lib/cloudi_core/include || \
 	 exit 0)
-	rm -f $(top_srcdir)/lib/cloudi_core/ebin \
-          $(top_srcdir)/lib/cloudi_service_api_requests/ebin \
-          $(top_srcdir)/lib/cloudi_service_db/ebin \
-          $(top_srcdir)/lib/cloudi_service_db_cassandra/ebin \
-          $(top_srcdir)/lib/cloudi_service_db_couchdb/ebin \
-          $(top_srcdir)/lib/cloudi_service_db_elasticsearch/ebin \
-          $(top_srcdir)/lib/cloudi_service_db_memcached/ebin \
-          $(top_srcdir)/lib/cloudi_service_db_mysql/ebin \
-          $(top_srcdir)/lib/cloudi_service_db_pgsql/ebin \
-          $(top_srcdir)/lib/cloudi_service_db_tokyotyrant/ebin \
-          $(top_srcdir)/lib/cloudi_service_filesystem/ebin \
-          $(top_srcdir)/lib/cloudi_service_http_cowboy/ebin \
-          $(top_srcdir)/lib/cloudi_service_http_elli/ebin \
-          $(top_srcdir)/lib/cloudi_service_map_reduce/ebin \
-          $(top_srcdir)/lib/cloudi_service_quorum/ebin \
-          $(top_srcdir)/lib/cloudi_service_tcp/ebin \
-          $(top_srcdir)/lib/cloudi_service_timers/ebin \
-          $(top_srcdir)/lib/cloudi_service_udp/ebin \
-          $(top_srcdir)/lib/cloudi_service_work_manager/ebin \
-          $(top_srcdir)/lib/cloudi_service_zeromq/ebin \
-          $(top_srcdir)/lib/pqueue/ebin \
-          $(top_srcdir)/lib/quickrand/ebin \
-          $(top_srcdir)/lib/cpg/ebin \
-          $(top_srcdir)/lib/uuid/ebin \
-          $(top_srcdir)/lib/trie/ebin \
-          $(top_srcdir)/lib/reltool_util/ebin \
-          $(top_srcdir)/lib/key2value/ebin \
-          $(top_srcdir)/external/nodefinder/nodefinder/ebin \
-          $(top_srcdir)/external/nodefinder/ec2nodefinder/ebin \
-          $(top_srcdir)/external/nodefinder/combonodefinder/ebin \
-          $(top_srcdir)/external/jsx/ebin \
-          $(top_srcdir)/external/etokyotyrant/ebin \
-          $(top_srcdir)/external/poolboy/ebin \
-          $(top_srcdir)/external/thrift/ebin \
-          $(top_srcdir)/external/erlasticsearch/ebin \
-          $(top_srcdir)/external/erlang_cassandra/ebin \
-          $(top_srcdir)/external/epgsql/ebin \
-          $(top_srcdir)/external/emysql/ebin \
-          $(top_srcdir)/external/ememcached/ebin \
-          $(top_srcdir)/external/ecouchdb/ebin \
-          $(top_srcdir)/external/cowboy/ebin \
-          $(top_srcdir)/external/ranch/ebin \
-          $(top_srcdir)/external/elli/ebin \
-          $(top_srcdir)/external/dynamic_compile/ebin
 
 clean-configure: distclean
 
@@ -553,7 +598,8 @@ distclean-local: rebar-directories-distclean \
            $(top_srcdir)/tests/ct/logs \
            $(top_srcdir)/lib/cloudi_service_db_cassandra/test_ct/logs \
            $(top_srcdir)/lib/cloudi_service_db_elasticsearch/test_ct/logs \
-           $(top_srcdir)/lib/cloudi_service_db_pgsql/test_ct/logs
+           $(top_srcdir)/lib/cloudi_service_db_pgsql/test_ct/logs \
+           $(top_srcdir)/lib/cloudi_service_quorum/test_ct/logs
 	find $(top_srcdir)/api -name "Makefile.in" | xargs rm -f
 	find $(top_srcdir)/lib -name "Makefile.in" | xargs rm -f
 	find $(top_srcdir)/tests -name "Makefile.in" | xargs rm -f
@@ -568,6 +614,7 @@ rebar-directories-distclean:
 	test -e $(top_builddir)/rebar && rm -f $(top_builddir)/rebar || exit 0
 
 erlang-applications-scope-remove:
+	rm -f scoped
 	$(ESCRIPT) $(top_srcdir)/lib/reltool_util/scope $(SCOPE_ARGS) -u
 
 dialyze: all \
@@ -589,6 +636,7 @@ dialyze: all \
               lib/cloudi_service_http_elli/ebin/ \
               lib/cloudi_service_map_reduce/ebin/ \
               lib/cloudi_service_quorum/ebin/ \
+              lib/cloudi_service_router/ebin/ \
               lib/cloudi_service_tcp/ebin/ \
               lib/cloudi_service_timers/ebin/ \
               lib/cloudi_service_udp/ebin/ \
@@ -602,6 +650,7 @@ dialyze: all \
               lib/reltool_util/ebin/ \
               lib/key2value/ebin/ \
               external/cowboy/ebin \
+              external/cowlib/ebin \
               external/elli/ebin \
               external/dynamic_compile/ebin \
               external/etokyotyrant/ebin \
@@ -855,6 +904,9 @@ tests-messaging-install: \
         "$(DESTDIR)$(cloudi_prefix)/tests/messaging/ebin/"
 	$(INSTALL_DATA) \
         "$(top_builddir)/tests/messaging/ebin/cloudi_service_messaging_sequence3.beam" \
+        "$(DESTDIR)$(cloudi_prefix)/tests/messaging/ebin/"
+	$(INSTALL_DATA) \
+        "$(top_builddir)/tests/messaging/ebin/cloudi_service_messaging_sequence4.beam" \
         "$(DESTDIR)$(cloudi_prefix)/tests/messaging/ebin/"
 	$(INSTALL_DATA) "$(top_builddir)/tests/messaging/jar/cloudi.jar" \
                     "$(DESTDIR)$(cloudi_prefix)/tests/messaging/jar/"

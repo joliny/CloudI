@@ -55,6 +55,16 @@
 % logged enough
 -define(LOGGER_FLOODING_DELTA, 10). % microseconds
 
+% message queue size that causes the logger to use synchronous messaging
+% to avoid excessive memory consumption and system death
+% (i.e., when the logger is not being flooded quickly by an individual
+%  process, but is simply overloaded by all processes)
+-define(LOGGER_MSG_QUEUE_SYNC, 1000).
+
+% message queue size that causes the logger to switch back to
+% asynchronous messaging after using synchronous messaging
+-define(LOGGER_MSG_QUEUE_ASYNC, (?LOGGER_MSG_QUEUE_SYNC - 250)).
+
 % periodic connection checks to determine if the udp connection is still active
 % must be a short time since this impacts MaxR and MaxT.  However, this time
 % becomes a hard maximum (minus a delta for overhead) for a task time target
@@ -65,6 +75,12 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Constants that should never be changed                                     %
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% for using cloudi_core as an isolated Erlang application
+% outside of the CloudI repository
+% (only internal services are supported,
+%  due to the extra compilation required for external services support)
+%-define(CLOUDI_CORE_STANDALONE, true).
 
 % cloudi_x_pqueue4 usage limited by the signed byte integer storage
 -define(PRIORITY_HIGH, -128).
@@ -80,4 +96,11 @@
                 erlang:list_to_atom("cloudi_x_cpg_x_" ++
                                     erlang:atom_to_list(Scope))
         end).
+
+% maximum timeout value for erlang:send_after/3 and gen_server:call
+-define(TIMEOUT_MAX_ERLANG, 4294967295).
+% maximum timeout value for a service request
+% (limitation for internal service requests, external service requests
+%  should have a maximum of TIMEOUT_MAX_ERLANG)
+-define(TIMEOUT_MAX, ?TIMEOUT_MAX_ERLANG - ?TIMEOUT_DELTA).
 

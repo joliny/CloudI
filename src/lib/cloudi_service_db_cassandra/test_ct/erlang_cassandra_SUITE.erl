@@ -13,7 +13,7 @@
 
 -include_lib("proper/include/proper.hrl").
 -include_lib("common_test/include/ct.hrl").
--include_lib("erlang_cassandra/include/cloudi_x_cassandra_types.hrl").
+-include_lib("erlang_cassandra/include/cloudi_x_erlang_cassandra_types.hrl").
 -include_lib("cloudi_core/include/cloudi_logger.hrl").
 
 -compile(export_all).
@@ -25,7 +25,6 @@
 -define(NUMTESTS, 10).
 
 % Cloudi
--define(CLOUDI_CONF, "cloudi.conf").
 -define(DB_PREFIX, "/dbpopulator/cloudi_x_erlang_cassandra/").
 -define(DB_TARGET, "testdb").
 -define(POOL_OPTIONS, [{size, 1}, {max_overflow, 0}]).
@@ -97,23 +96,25 @@ init_per_testcase(_TestCase, Config) ->
 end_per_testcase(_TestCase, _Config) ->
     ok.
 
-groups_condition(Groups) ->
+test_condition(L) ->
     case gen_tcp:connect(?DEFAULT_THRIFT_HOST, ?DEFAULT_THRIFT_PORT, []) of
         {ok, Socket} ->
             catch gen_tcp:close(Socket),
-            Groups;
+            L;
         {error, econnrefused} ->
-            ?LOG_ERROR("unable to test ~p",
-                       [{?DEFAULT_THRIFT_HOST, ?DEFAULT_THRIFT_PORT}]),
-            [];
+            error_logger:error_msg("unable to test ~p",
+                                   [{?DEFAULT_THRIFT_HOST,
+                                     ?DEFAULT_THRIFT_PORT}]),
+            {skip, cassandra_dead};
         {error, Reason} ->
-            ?LOG_ERROR("unable to test ~p: ~p",
-                       [{?DEFAULT_THRIFT_HOST, ?DEFAULT_THRIFT_PORT}, Reason]),
-            []
+            error_logger:error_msg("unable to test ~p: ~p",
+                                   [{?DEFAULT_THRIFT_HOST,
+                                     ?DEFAULT_THRIFT_PORT}, Reason]),
+            {skip, cassandra_dead}
     end.
 
 groups() ->
-    groups_condition([
+    [
         {keyspace_crud, [{repeat, 1}],
          [
                 t_update_keyspace,
@@ -160,10 +161,10 @@ groups() ->
                 t_update_keyspace
          ]}
 
-    ]).
+    ].
 
 all() ->
-    [
+    test_condition([
         {group, keyspace_crud},
         {group, column_family_crud},
         {group, column_crud},
@@ -171,7 +172,7 @@ all() ->
         {group, count},
         {group, counter_crud},
         {group, cql}
-    ].
+    ]).
 
 t_add_drop_keyspace(Config) ->
     ?PROPTEST(prop_add_drop_keyspace, Config).
@@ -825,12 +826,11 @@ unload_cloudi_service(Prefixes) ->
                                 _ -> ok
                             end end, cloudi_services()) end, Prefixes).
 
-setup_cloudi(Config) ->
-    DataDir = ?config(data_dir, Config),
-    ConfFile = DataDir ++ ?CLOUDI_CONF,
-    application:set_env(cloudi_core, configuration, ConfFile),
-    cloudi_x_reltool_util:application_start(cloudi_core, [{configuration, ConfFile}], 1000),
-    Config.
+setup_cloudi(_Config) ->
+    CloudIConfig = [{acl, []}, {services, []}, {nodes, []},
+                    {logging, [{file, "cloudi.log"}]}],
+    ok = cloudi_x_reltool_util:application_start(cloudi_core,
+                                        [{configuration, CloudIConfig}],1000).
 
 
 teardown_cloudi(_Config) ->

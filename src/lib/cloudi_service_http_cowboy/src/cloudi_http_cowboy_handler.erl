@@ -8,7 +8,7 @@
 %%%
 %%% BSD LICENSE
 %%% 
-%%% Copyright (c) 2012-2013, Michael Truog <mjtruog at gmail dot com>
+%%% Copyright (c) 2012-2014, Michael Truog <mjtruog at gmail dot com>
 %%% All rights reserved.
 %%% 
 %%% Redistribution and use in source and binary forms, with or without
@@ -43,8 +43,8 @@
 %%% DAMAGE.
 %%%
 %%% @author Michael Truog <mjtruog [at] gmail (dot) com>
-%%% @copyright 2012-2013 Michael Truog
-%%% @version 1.3.0 {@date} {@time}
+%%% @copyright 2012-2014 Michael Truog
+%%% @version 1.3.1 {@date} {@time}
 %%%------------------------------------------------------------------------
 
 -module(cloudi_http_cowboy_handler).
@@ -58,6 +58,7 @@
 %% cloudi_x_cowboy_http_handler callbacks
 -export([init/3,
          handle/2,
+         info/3,
          terminate/3]).
 
 %% cloudi_x_cowboy_websocket_handler callbacks
@@ -67,6 +68,7 @@
          websocket_terminate/3]).
 
 -include_lib("cloudi_core/include/cloudi_logger.hrl").
+-include_lib("cloudi_core/include/cloudi_service_children.hrl").
 -include("cloudi_http_cowboy_handler.hrl").
 
 %%%------------------------------------------------------------------------
@@ -76,6 +78,7 @@
 -record(websocket_state,
     {
         % for service requests entering CloudI
+        websocket_connect_trans_id,
         name_incoming,
         name_outgoing,
         request_info,
@@ -98,15 +101,15 @@ init(_Transport, Req0, #cowboy_state{use_websockets = true} = State) ->
         {undefined, Req1} ->
             {ok, Req1, State};
         {Upgrade, Req1} ->
-            ?LOG_WARN("Unknown protocol: ~p", [Upgrade]),
-            {loop, Req1, State}
+            ?LOG_ERROR("Unknown protocol: ~p", [Upgrade]),
+            {shutdown, Req1, State}
     end;
 init(_Transport, Req, #cowboy_state{use_websockets = false} = State) ->
     {ok, Req, State}.
 
 handle(Req0,
-       #cowboy_state{service = Service,
-                     timeout_async = TimeoutAsync,
+       #cowboy_state{dispatcher = Dispatcher,
+                     context = Context,
                      output_type = OutputType,
                      content_type_forced = ContentTypeForced,
                      content_types_accepted = ContentTypesAccepted,
@@ -121,7 +124,8 @@ handle(Req0,
     {HeadersIncoming0, Req2} = cloudi_x_cowboy_req:headers(Req1),
     {QsVals, Req3} = cloudi_x_cowboy_req:qs_vals(Req2),
     {PathRaw, Req4} = cloudi_x_cowboy_req:path(Req3),
-    {Client, Req5} = cloudi_x_cowboy_req:peer(Req4),
+    {{ClientIpAddr, ClientPort} = Client,
+     Req5} = cloudi_x_cowboy_req:peer(Req4),
     {NameIncoming, ReqN} = service_name_incoming(UseClientIpPrefix,
                                                  UseHostPrefix,
                                                  PathRaw,
@@ -169,22 +173,27 @@ handle(Req0,
                     NameIncoming ++ [$/ |
                         string:to_lower(erlang:binary_to_list(Method))]
             end,
+            PeerShort = erlang:list_to_binary(inet_parse:ntoa(ClientIpAddr)),
+            PeerLong = cloudi_ip_address:to_binary(ClientIpAddr),
+            PeerPort = erlang:integer_to_binary(ClientPort),
+            HeadersIncoming1 = [{<<"peer">>, PeerShort},
+                                {<<"peer-port">>, PeerPort},
+                                {<<"source-address">>, PeerLong},
+                                {<<"source-port">>, PeerPort} |
+                                HeadersIncoming0],
             HeadersIncomingN = if
                 SetXForwardedFor =:= true ->
                     case lists:keyfind(<<"x-forwarded-for">>, 1,
                                        HeadersIncoming0) of
                         false ->
-                            {ClientIpAddr, _ClientPort} = Client,
-                            [{<<"x-forwarded-for">>,
-                              erlang:list_to_binary(
-                                  inet_parse:ntoa(ClientIpAddr))} |
-                             HeadersIncoming0];
+                            [{<<"x-forwarded-for">>, PeerShort} |
+                             HeadersIncoming1];
                         _ ->
-                            HeadersIncoming0
+                            HeadersIncoming1
                             
                     end;
                 SetXForwardedFor =:= false ->
-                    HeadersIncoming0
+                    HeadersIncoming1
             end,
             Body = if
                 Method =:= <<"GET">> ->
@@ -194,7 +203,7 @@ handle(Req0,
                     case header_content_type(HeadersIncoming0) of
                         <<"application/zip">> ->
                             'application_zip';
-                        <<$m,$u,$l,$t,$i,$p,$a,$r,$t,$/, _/binary>> ->
+                        <<"multipart/", _/binary>> ->
                             'multipart';
                         _ ->
                             'normal'
@@ -208,8 +217,9 @@ handle(Req0,
                 true ->
                     'normal'
             end,
-            case handle_request(Service, NameOutgoing, HeadersIncomingN,
-                                OutputType, TimeoutAsync, Body, ReqN) of
+            case handle_request(Dispatcher, Context,
+                                NameOutgoing, HeadersIncomingN,
+                                OutputType, Body, ReqN) of
                 {{cowboy_response, HeadersOutgoing, Response}, ReqN0} ->
                     {HttpCode,
                      Req} = handle_response(NameIncoming, HeadersOutgoing,
@@ -251,21 +261,30 @@ handle(Req0,
             end
     end.
 
+info(Message, Req, State) ->
+    ?LOG_WARN("ignored ~p", [Message]),
+    {ok, Req, State}.
+
 terminate(_Reason, _Req, _State) ->
     ok.
 
 websocket_init(_Transport, Req0,
-               #cowboy_state{prefix = Prefix,
+               #cowboy_state{dispatcher = Dispatcher,
+                             context = Context,
+                             prefix = Prefix,
                              timeout_websocket = TimeoutWebsocket,
                              output_type = OutputType,
+                             set_x_forwarded_for = SetXForwardedFor,
+                             websocket_connect = WebsocketConnect,
                              use_websockets = true,
                              use_host_prefix = UseHostPrefix,
                              use_client_ip_prefix = UseClientIpPrefix,
                              use_method_suffix = UseMethodSuffix} = State) ->
     {Method, Req1} = cloudi_x_cowboy_req:method(Req0),
-    {HeadersIncoming, Req2} = cloudi_x_cowboy_req:headers(Req1),
+    {HeadersIncoming0, Req2} = cloudi_x_cowboy_req:headers(Req1),
     {PathRaw, Req3} = cloudi_x_cowboy_req:path(Req2),
-    {Client, Req4} = cloudi_x_cowboy_req:peer(Req3),
+    {{ClientIpAddr, ClientPort} = Client,
+     Req4} = cloudi_x_cowboy_req:peer(Req3),
     {NameIncoming, ReqN} = service_name_incoming(UseClientIpPrefix,
                                                  UseHostPrefix,
                                                  PathRaw,
@@ -277,26 +296,69 @@ websocket_init(_Transport, Req0,
         Method =:= <<"GET">> ->
             NameIncoming ++ "/get"
     end,
+    % can not turn-off the /websocket suffix, since it would otherwise
+    % cause a conflict with service requests coming from HTTP into CloudI
+    % when UseMethodSuffix == false
     NameWebsocket = erlang:binary_to_list(PathRaw) ++ "/websocket",
-    case lists:prefix(Prefix, NameWebsocket) of
+    HeadersIncoming1 = case lists:prefix(Prefix, NameWebsocket) of
         true ->
             % service requests are only received if they relate to
             % the service's prefix
-            ok = cloudi_x_cpg:join(NameWebsocket);
+            ok = cloudi_x_cpg:join(NameWebsocket),
+            [{<<"service-name">>, erlang:list_to_binary(NameWebsocket)} |
+             HeadersIncoming0];
         false ->
-            ok
+            HeadersIncoming0
+    end,
+    PeerShort = erlang:list_to_binary(inet_parse:ntoa(ClientIpAddr)),
+    PeerLong = cloudi_ip_address:to_binary(ClientIpAddr),
+    PeerPort = erlang:integer_to_binary(ClientPort),
+    HeadersIncoming2 = [{<<"peer">>, PeerShort},
+                        {<<"peer-port">>, PeerPort},
+                        {<<"source-address">>, PeerLong},
+                        {<<"source-port">>, PeerPort} | HeadersIncoming1],
+    HeadersIncomingN = if
+        SetXForwardedFor =:= true ->
+            case lists:keyfind(<<"x-forwarded-for">>, 1, HeadersIncoming0) of
+                false ->
+                    [{<<"x-forwarded-for">>, PeerShort} | HeadersIncoming2];
+                _ ->
+                    HeadersIncoming2
+                    
+            end;
+        SetXForwardedFor =:= false ->
+            HeadersIncoming2
     end,
     RequestInfo = if
-        OutputType =:= internal; OutputType =:= list ->
-            HeadersIncoming;
-        OutputType =:= external; OutputType =:= binary ->
-            headers_external_incoming(HeadersIncoming)
+        (OutputType =:= external) orelse (OutputType =:= binary) ->
+            headers_external_incoming(HeadersIncomingN);
+        (OutputType =:= internal) orelse (OutputType =:= list) ->
+            HeadersIncomingN
+    end,
+    WebsocketConnectTransId = if
+        is_list(WebsocketConnect) ->
+            Request = if
+                (OutputType =:= external) orelse
+                (OutputType =:= internal) orelse
+                (OutputType =:= binary) ->
+                    <<"CONNECT">>;
+                (OutputType =:= list) ->
+                    "CONNECT"
+            end,
+            {ok, TransId} = send_async_minimal(Dispatcher, Context,
+                                               WebsocketConnect,
+                                               RequestInfo, Request, self()),
+            TransId;
+        true ->
+            undefined
     end,
     {ok, ReqN,
-     State#cowboy_state{websocket_state = #websocket_state{
-                            name_incoming = NameIncoming,
-                            name_outgoing = NameOutgoing,
-                            request_info = RequestInfo}}, TimeoutWebsocket}.
+     State#cowboy_state{
+         websocket_state = #websocket_state{
+             websocket_connect_trans_id = WebsocketConnectTransId,
+             name_incoming = NameIncoming,
+             name_outgoing = NameOutgoing,
+             request_info = RequestInfo}}, TimeoutWebsocket}.
 
 websocket_handle({ping, _Payload}, Req, State) ->
     % cowboy automatically responds with pong
@@ -317,11 +379,11 @@ websocket_handle({WebSocketResponseType, ResponseBinary}, Req,
     when WebSocketResponseType =:= text;
          WebSocketResponseType =:= binary ->
     Response = if
-        OutputType =:= list ->
-            erlang:binary_to_list(ResponseBinary);
-        OutputType =:= internal; OutputType =:= external;
-        OutputType =:= binary ->
-            ResponseBinary
+        (OutputType =:= external) orelse (OutputType =:= internal) orelse
+        (OutputType =:= binary) ->
+            ResponseBinary;
+        (OutputType =:= list) ->
+            erlang:binary_to_list(ResponseBinary)
     end,
     Timeout = case erlang:cancel_timer(ResponseTimer) of
         false ->
@@ -354,8 +416,8 @@ websocket_handle({WebSocketResponseType, ResponseBinary}, Req,
                       });
 
 websocket_handle({WebSocketRequestType, RequestBinary}, Req,
-                 #cowboy_state{service = Service,
-                               timeout_async = TimeoutAsync,
+                 #cowboy_state{dispatcher = Dispatcher,
+                               context = Context,
                                output_type = OutputType,
                                use_websockets = true,
                                websocket_state = #websocket_state{
@@ -367,38 +429,40 @@ websocket_handle({WebSocketRequestType, RequestBinary}, Req,
          WebSocketRequestType =:= binary ->
     RequestStartMicroSec = ?LOG_WARN_APPLY(fun websocket_time_start/0, []),
     Request = if
-        OutputType =:= list ->
-            erlang:binary_to_list(RequestBinary);
-        OutputType =:= internal; OutputType =:= external;
-        OutputType =:= binary ->
-            RequestBinary
+        (OutputType =:= external) orelse (OutputType =:= internal) orelse
+        (OutputType =:= binary) ->
+            RequestBinary;
+        (OutputType =:= list) ->
+            erlang:binary_to_list(RequestBinary)
     end,
-    Service ! {cowboy_request, self(), NameOutgoing, RequestInfo, Request},
-    receive
-        {cowboy_response, _ResponseInfo, Response} ->
-            ResponseBinary = if
-                OutputType =:= list, is_list(Response) ->
-                    erlang:list_to_binary(Response);
-                OutputType =:= internal; OutputType =:= external;
-                OutputType =:= binary; is_binary(Response) ->
-                    Response
-            end,
+    ResponseBinaryF = fun(Data) ->
+        if
+            (((OutputType =:= external) orelse
+              (OutputType =:= internal)) andalso
+             (is_binary(Data) orelse
+              is_list(Data))) orelse % iolist
+            ((OutputType =:= binary) andalso
+             is_binary(Data)) ->
+                Data;
+            ((OutputType =:= list) andalso
+             is_list(Data)) ->
+                erlang:list_to_binary(Data)
+        end
+    end,
+    case send_sync_minimal(Dispatcher, Context,
+                           NameOutgoing, RequestInfo, Request, self()) of
+        {ok, ResponseInfo, Response} ->
             ?LOG_TRACE_APPLY(fun websocket_time_end_success/3,
                              [NameIncoming, NameOutgoing,
                               RequestStartMicroSec]),
-            {reply, {WebSocketRequestType, ResponseBinary}, Req, State};
-        {cowboy_error, timeout} ->
-            ?LOG_WARN_APPLY(fun websocket_time_end_error/3,
-                            [NameIncoming,
-                             RequestStartMicroSec, timeout]),
-            {reply, {WebSocketRequestType, <<>>}, Req, State};
-        {cowboy_error, Reason} ->
-            ?LOG_WARN_APPLY(fun websocket_time_end_error/3,
-                            [NameIncoming,
-                             RequestStartMicroSec, Reason]),
-            {reply, {close, 1011, <<>>}, Req, State}
-    after
-        TimeoutAsync ->
+            case websocket_terminate_check(ResponseInfo) of
+                true ->
+                    {shutdown, Req, State};
+                false ->
+                    {reply, {WebSocketRequestType,
+                             ResponseBinaryF(Response)}, Req, State}
+            end;
+        {error, timeout} ->
             ?LOG_WARN_APPLY(fun websocket_time_end_error/3,
                             [NameIncoming,
                              RequestStartMicroSec, timeout]),
@@ -418,6 +482,29 @@ websocket_info(response_timeout, Req,
                           request_pending = undefined}
                       });
 
+websocket_info({Type, _Name, _Pattern, _RequestInfo, RequestBinary,
+                Timeout, _Priority, _TransId, _Source} = T, Req,
+               #cowboy_state{output_type = OutputType,
+                             use_websockets = true,
+                             websocket_state = #websocket_state{
+                                 response_pending = false} = WebSocketState
+                             } = State)
+    when ((((OutputType =:= external) orelse
+            (OutputType =:= internal)) andalso
+           (is_binary(RequestBinary) orelse is_list(RequestBinary))) orelse
+          ((OutputType =:= binary) andalso
+           is_binary(RequestBinary))),
+         (Type =:= 'cloudi_service_send_async' orelse
+          Type =:= 'cloudi_service_send_sync') ->
+    ResponseTimer = erlang:send_after(Timeout, self(), response_timeout),
+    % RequestBinary may be an iolist
+    {reply, {binary, RequestBinary}, Req,
+     State#cowboy_state{websocket_state = WebSocketState#websocket_state{
+                            response_pending = true,
+                            response_timer = ResponseTimer,
+                            request_pending = T}
+                        }};
+
 websocket_info({Type, _Name, _Pattern, _RequestInfo, Request,
                 Timeout, _Priority, _TransId, _Source} = T, Req,
                #cowboy_state{output_type = OutputType,
@@ -425,7 +512,8 @@ websocket_info({Type, _Name, _Pattern, _RequestInfo, Request,
                              websocket_state = #websocket_state{
                                  response_pending = false} = WebSocketState
                              } = State)
-    when (OutputType =:= list), (is_list(Request) orelse is_binary(Request)),
+    when ((OutputType =:= list) andalso
+          (is_list(Request) orelse is_binary(Request))),
          (Type =:= 'cloudi_service_send_async' orelse
           Type =:= 'cloudi_service_send_sync') ->
     RequestBinary = if
@@ -442,25 +530,6 @@ websocket_info({Type, _Name, _Pattern, _RequestInfo, Request,
                             request_pending = T}
                         }};
 
-websocket_info({Type, _Name, _Pattern, _RequestInfo, RequestBinary,
-                Timeout, _Priority, _TransId, _Source} = T, Req,
-               #cowboy_state{output_type = OutputType,
-                             use_websockets = true,
-                             websocket_state = #websocket_state{
-                                 response_pending = false} = WebSocketState
-                             } = State)
-    when (OutputType =:= internal orelse OutputType =:= external orelse
-          OutputType =:= binary), is_binary(RequestBinary),
-         (Type =:= 'cloudi_service_send_async' orelse
-          Type =:= 'cloudi_service_send_sync') ->
-    ResponseTimer = erlang:send_after(Timeout, self(), response_timeout),
-    {reply, {binary, RequestBinary}, Req,
-     State#cowboy_state{websocket_state = WebSocketState#websocket_state{
-                            response_pending = true,
-                            response_timer = ResponseTimer,
-                            request_pending = T}
-                        }};
-
 websocket_info({Type, _, _, _, Request,
                 Timeout, Priority, TransId, _} = T, Req,
                #cowboy_state{output_type = OutputType,
@@ -470,10 +539,13 @@ websocket_info({Type, _, _, _, Request,
                                  queued = Queue,
                                  recv_timeouts = RecvTimeouts} = WebSocketState
                              } = State)
-    when (((OutputType =:= list) andalso
-           (is_list(Request) orelse is_binary(Request))) or
-          ((OutputType =:= internal orelse OutputType =:= external orelse
-            OutputType =:= binary) andalso is_binary(Request))),
+    when ((((OutputType =:= external) orelse
+            (OutputType =:= internal)) andalso
+           (is_binary(Request) orelse is_list(Request))) orelse
+          ((OutputType =:= binary) andalso
+           is_binary(Request)) orelse
+          ((OutputType =:= list) andalso
+           (is_list(Request) orelse is_binary(Request)))),
          (Type =:= 'cloudi_service_send_async' orelse
           Type =:= 'cloudi_service_send_sync'),
          (Timeout > 0) ->
@@ -485,10 +557,20 @@ websocket_info({Type, _, _, _, Request,
          queued = cloudi_x_pqueue4:in(T, Priority, Queue)}
      }};
 
-websocket_info({Type, _, _, _, _, _, _, _, _}, Req,
-               #cowboy_state{use_websockets = true} = State)
+websocket_info({Type, Name, _, _, _,
+                Timeout, _, TransId, _}, Req,
+               #cowboy_state{output_type = OutputType,
+                             use_websockets = true} = State)
     when Type =:= 'cloudi_service_send_async';
          Type =:= 'cloudi_service_send_sync' ->
+    if
+        Timeout > 0 ->
+            ?LOG_ERROR("output ~p config ignoring service request to ~s (~s)",
+                       [OutputType, Name,
+                        cloudi_x_uuid:uuid_to_string(TransId)]);
+        true ->
+            ok
+    end,
     {ok, Req, State};
 
 websocket_info({'cloudi_service_recv_timeout', Priority, TransId}, Req,
@@ -506,18 +588,95 @@ websocket_info({'cloudi_service_recv_timeout', Priority, TransId}, Req,
          queued = NewQueue}
      }};
 
-websocket_info({cowboy_response, _ResponseInfo, _Response}, Req, State) ->
-    {ok, Req, State};
+websocket_info({'cloudi_service_return_async',
+                _, _, <<>>, <<>>, _, TransId, _}, Req,
+               #cowboy_state{use_websockets = true,
+                             websocket_state = #websocket_state{
+                                 websocket_connect_trans_id = TransId
+                                 } = WebSocketState
+                             } = State) ->
+    {ok, Req,
+     State#cowboy_state{websocket_state = WebSocketState#websocket_state{
+         websocket_connect_trans_id = undefined}
+     }};
 
-websocket_info({cowboy_error, _Reason}, Req, State) ->
-    {ok, Req, State};
+websocket_info({'cloudi_service_return_async',
+                _, _, ResponseInfo, Response, _, TransId, _}, Req,
+               #cowboy_state{output_type = OutputType,
+                             use_websockets = true,
+                             websocket_state = #websocket_state{
+                                 websocket_connect_trans_id = TransId
+                                 } = WebSocketState
+                             } = State) ->
+    case websocket_terminate_check(ResponseInfo) of
+        true ->
+            {shutdown, Req, State};
+        false ->
+            WebSocketResponse = if
+                ((((OutputType =:= external) orelse
+                   (OutputType =:= internal)) andalso
+                  (is_binary(Response) orelse
+                   is_list(Response))) orelse % iolist
+                 ((OutputType =:= binary) andalso
+                  is_binary(Response))) ->
+                    {binary, Response};
+                ((OutputType =:= list) andalso
+                 (is_list(Response))) ->
+                    {text, erlang:list_to_binary(Response)}
+            end,
+            {reply, WebSocketResponse, Req,
+             State#cowboy_state{
+                 websocket_state = WebSocketState#websocket_state{
+                     websocket_connect_trans_id = undefined}
+             }}
+    end;
 
 websocket_info(Info, Req,
                #cowboy_state{use_websockets = true} = State) ->
     ?LOG_ERROR("Invalid websocket request state: \"~p\"", [Info]),
     {ok, Req, State}.
 
-websocket_terminate(_Reason, _Req, _State) ->
+websocket_terminate(Reason, _Req,
+                    #cowboy_state{
+                        dispatcher = Dispatcher,
+                        context = Context,
+                        output_type = OutputType,
+                        websocket_disconnect = WebsocketDisconnect,
+                        websocket_state = #websocket_state{
+                            request_info = RequestInfo}}) ->
+    if
+        is_list(WebsocketDisconnect) ->
+            Disconnect = case Reason of
+                {remote, CloseCode, CloseBinary}
+                    when is_integer(CloseCode) ->
+                    [<<"remote,">>,
+                     erlang:integer_to_binary(CloseCode), <<",">>,
+                     CloseBinary];
+                {ReasonType, ReasonDescription} ->
+                    [erlang:atom_to_binary(ReasonType, utf8), <<",">>,
+                     erlang:atom_to_binary(ReasonDescription, utf8)]
+            end,
+            NewRequestInfo = if
+                (OutputType =:= external) orelse (OutputType =:= binary) ->
+                    erlang:iolist_to_binary([<<"disconnection">>, 0,
+                                             Disconnect, 0,
+                                             RequestInfo]);
+                (OutputType =:= internal) orelse (OutputType =:= list) ->
+                    [{<<"disconnection">>, Disconnect} | RequestInfo]
+            end,
+            Request = if
+                (OutputType =:= external) orelse
+                (OutputType =:= internal) orelse
+                (OutputType =:= binary) ->
+                    <<"DISCONNECT">>;
+                (OutputType =:= list) ->
+                    "DISCONNECT"
+            end,
+            send_async_minimal(Dispatcher, Context, WebsocketDisconnect,
+                               NewRequestInfo, Request, self());
+        true ->
+            ok
+    end,
     ok.
 
 %%%------------------------------------------------------------------------
@@ -531,11 +690,17 @@ upgrade_request(Req0) ->
         {ok, C, Req1} ->
             case lists:member(<<"upgrade">>, C) of
                 true ->
-                    {ok, [U | _],
+                    {ok, [U0 | _],
                      Req2} = cloudi_x_cowboy_req:parse_header(<<"upgrade">>,
                                                               Req1),
-                    {erlang:list_to_existing_atom(erlang:binary_to_list(U)),
-                     Req2};
+                    try erlang:binary_to_existing_atom(U0, utf8) of
+                        U1 ->
+                            {U1, Req2}
+                    catch
+                        error:badarg ->
+                            % non-atom is ignored and logged
+                            {U0, Req2}
+                    end;
                 false ->
                     {undefined, Req1}
             end
@@ -581,13 +746,7 @@ headers_external_outgoing([{_, _} | _] = ResponseInfo) ->
     ResponseInfo;
 headers_external_outgoing(ResponseInfo)
     when is_binary(ResponseInfo) ->
-    Options = case binary:last(ResponseInfo) of
-        0 ->
-            [global, {scope, {0, erlang:byte_size(ResponseInfo) - 1}}];
-        _ ->
-            [global]
-    end,
-    headers_external_outgoing(binary:split(ResponseInfo, <<0>>, Options), []).
+    headers_external_outgoing(binary:split(ResponseInfo, <<0>>, [global]), []).
 
 headers_external_outgoing([<<>>], Result) ->
     lists:reverse(Result);
@@ -645,54 +804,51 @@ websocket_time_end_error(NameIncoming,
 websocket_request_end(Name, NewTimeout, OldTimeout) ->
     ?LOG_TRACE("~s ~p ms", [Name, OldTimeout - NewTimeout]).
 
-handle_request(Service, Name, Headers,
-               OutputType, Timeout, 'normal', Req) ->
+handle_request(Dispatcher, Context, Name, Headers,
+               OutputType, 'normal', Req) ->
     {ok, Body, NextReq} = cloudi_x_cowboy_req:body(Req),
-    handle_request(Service, Name, Headers,
-                   OutputType, Timeout, Body, NextReq);
-handle_request(Service, Name, Headers,
-               OutputType, Timeout, 'application_zip', Req) ->
+    handle_request(Dispatcher, Context, Name, Headers,
+                   OutputType, Body, NextReq);
+handle_request(Dispatcher, Context, Name, Headers,
+               OutputType, 'application_zip', Req) ->
     {ok, Body, NextReq} = cloudi_x_cowboy_req:body(Req),
-    handle_request(Service, Name, Headers,
-                   OutputType, Timeout, zlib:unzip(Body), NextReq);
-handle_request(Service, Name, Headers,
-               OutputType, Timeout, 'multipart', Req) ->
+    handle_request(Dispatcher, Context, Name, Headers,
+                   OutputType, zlib:unzip(Body), NextReq);
+handle_request(Dispatcher, Context, Name, Headers,
+               OutputType, 'multipart', Req) ->
     MultipartId = erlang:list_to_binary(erlang:pid_to_list(self())),
     MultipartData = cloudi_x_cowboy_req:multipart_data(Req),
     PartFirst = handle_request_multipart_send(MultipartData, [], 0),
-    handle_request_multipart(Service, Name, lists:keysort(1, Headers),
-                             OutputType, Timeout, MultipartId, PartFirst);
-handle_request(Service, Name, Headers,
-               OutputType, Timeout, Body, Req)
+    handle_request_multipart([], Dispatcher, Context, Name,
+                             lists:keysort(1, Headers),
+                             OutputType, MultipartId, PartFirst);
+handle_request(Dispatcher, Context, Name, Headers,
+               OutputType, Body, Req)
     when is_binary(Body) ->
     RequestInfo = if
-        OutputType =:= internal; OutputType =:= list ->
-            Headers;
-        OutputType =:= external; OutputType =:= binary ->
-            headers_external_incoming(Headers)
+        (OutputType =:= external) orelse (OutputType =:= binary) ->
+            headers_external_incoming(Headers);
+        (OutputType =:= internal) orelse (OutputType =:= list) ->
+            Headers
     end,
     Request = if
-        OutputType =:= list ->
-            erlang:binary_to_list(Body);
-        OutputType =:= internal; OutputType =:= external;
-        OutputType =:= binary ->
-            Body
+        (OutputType =:= external) orelse (OutputType =:= internal) orelse
+        (OutputType =:= binary) ->
+            Body;
+        (OutputType =:= list) ->
+            erlang:binary_to_list(Body)
     end,
-    Service ! {cowboy_request, self(),
-               Name, RequestInfo, Request},
-    receive
-        {cowboy_response, ResponseInfo, Response} ->
+    case send_sync_minimal(Dispatcher, Context,
+                           Name, RequestInfo, Request, self()) of
+        {ok, ResponseInfo, Response} ->
             HeadersOutgoing = headers_external_outgoing(ResponseInfo),
             {{cowboy_response, HeadersOutgoing, Response}, Req};
-        {cowboy_error, _Reason} = Result ->
-            {Result, Req}
-    after
-        Timeout ->
+        {error, timeout} ->
             {{cowboy_error, timeout}, Req}
     end.
 
-handle_request_multipart(Service, Name, Headers,
-                         OutputType, Timeout, MultipartId,
+handle_request_multipart(TransIdList, Dispatcher, Context,
+                         Name, Headers, OutputType, MultipartId,
                          {HeadersPart0, BodyPart, I, Req}) ->
     MultipartData = cloudi_x_cowboy_req:multipart_data(Req),
     PartNext = handle_request_multipart_send(MultipartData,
@@ -713,27 +869,27 @@ handle_request_multipart(Service, Name, Headers,
              HeadersPart1]
     end,
     RequestInfo = if
-        OutputType =:= internal; OutputType =:= list ->
-            HeadersPart2;
-        OutputType =:= external; OutputType =:= binary ->
-            headers_external_incoming(HeadersPart2)
+        (OutputType =:= external) orelse (OutputType =:= binary) ->
+            headers_external_incoming(HeadersPart2);
+        (OutputType =:= internal) orelse (OutputType =:= list) ->
+            HeadersPart2
     end,
     Request = if
-        OutputType =:= list ->
-            erlang:binary_to_list(BodyPart);
-        OutputType =:= internal; OutputType =:= external;
-        OutputType =:= binary ->
-            BodyPart
+        (OutputType =:= external) orelse (OutputType =:= internal) orelse
+        (OutputType =:= binary) ->
+            BodyPart;
+        (OutputType =:= list) ->
+            erlang:binary_to_list(BodyPart)
     end,
-    Service ! {cowboy_request, self(),
-               Name, RequestInfo, Request},
-    handle_request_multipart(Service, Name, Headers,
-                             OutputType, Timeout, MultipartId,
-                             PartNext);
-handle_request_multipart(_Service, _Name, _Headers,
-                         _OutputType, Timeout, _MultipartId,
+    {ok, TransId} = send_async_minimal(Dispatcher, Context, Name,
+                                       RequestInfo, Request, self()),
+    handle_request_multipart([TransId | TransIdList], Dispatcher, Context,
+                             Name, Headers, OutputType, MultipartId, PartNext);
+handle_request_multipart(TransIdList, _Dispatcher, Context,
+                         _Name, _Headers, _OutputType, _MultipartId,
                          {I, Req}) ->
-    handle_request_multipart_receive(undefined, undefined, Timeout, I, Req).
+    handle_request_multipart_receive(lists:reverse(TransIdList),
+                                     Context, I, Req).
 
 headers_merge(HeadersPart, Headers) ->
     lists:keymerge(1, lists:keysort(1, HeadersPart), Headers).
@@ -754,58 +910,67 @@ handle_request_multipart_send({eof, Req},
                               _HeadersPart, I) ->
     {I, Req}.
 
-handle_request_multipart_receive(undefined, undefined, _Timeout, 0, Req) ->
+handle_request_multipart_receive_results([], _, [Error | _], Req) ->
+    {Error, Req};
+handle_request_multipart_receive_results([], [Success | _], _, Req) ->
+    {Success, Req};
+handle_request_multipart_receive_results([{ResponseInfo, Response, _} |
+                                          ResponseList],
+                                         SuccessList, ErrorList, Req) ->
+    HeadersOutgoing = headers_external_outgoing(ResponseInfo),
+    Status = case lists:keyfind(<<"status">>, 1, HeadersOutgoing) of
+        {_, V} ->
+            erlang:binary_to_integer(hd(binary:split(V, <<" ">>)));
+        false ->
+            200
+    end,
+    if
+        (Status >= 200) andalso (Status =< 299) ->
+            handle_request_multipart_receive_results(ResponseList,
+                                                     [{cowboy_response,
+                                                       HeadersOutgoing,
+                                                       Response} |
+                                                      SuccessList],
+                                                     ErrorList, Req);
+        true ->
+            handle_request_multipart_receive_results(ResponseList,
+                                                     SuccessList,
+                                                     [{cowboy_response,
+                                                       HeadersOutgoing,
+                                                       Response} |
+                                                      ErrorList], Req)
+    end.
+
+handle_request_multipart_receive(_, _, 0, Req) ->
     {{cowboy_error, multipart_empty}, Req};
-handle_request_multipart_receive(SuccessLast, undefined, _Timeout, 0, Req) ->
-    {SuccessLast, Req};
-handle_request_multipart_receive(_SuccessLast, ErrorLast, _Timeout, 0, Req) ->
-    {ErrorLast, Req};
-handle_request_multipart_receive(SuccessLast, ErrorLast, Timeout, I, Req) ->
-    receive
-        {cowboy_response, ResponseInfo, Response} ->
-            HeadersOutgoing = headers_external_outgoing(ResponseInfo),
-            Status = case lists:keyfind(<<"status">>, 1, HeadersOutgoing) of
-                {_, V} ->
-                    erlang:binary_to_integer(hd(binary:split(V, <<" ">>)));
-                false ->
-                    200
-            end,
-            if
-                (Status >= 200) andalso (Status =< 299) ->
-                    handle_request_multipart_receive({cowboy_response,
-                                                      HeadersOutgoing,
-                                                      Response},
-                                                     ErrorLast, Timeout,
-                                                     I - 1, Req);
-                true ->
-                    handle_request_multipart_receive(SuccessLast,
-                                                     {cowboy_response,
-                                                      HeadersOutgoing,
-                                                      Response},
-                                                     Timeout,
-                                                     I - 1, Req)
-            end;
-        {cowboy_error, _Reason} = Result ->
-            {Result, Req}
-    after
-        Timeout ->
-            if
-                ErrorLast =/= undefined ->
-                    {ErrorLast, Req};
-                true ->
-                    {{cowboy_error, timeout}, Req}
-            end
+handle_request_multipart_receive([], _, _, Req) ->
+    {{cowboy_error, timeout}, Req};
+handle_request_multipart_receive(TransIdList, _, I, Req)
+    when erlang:length(TransIdList) /= I ->
+    {{cowboy_error, timeout}, Req};
+handle_request_multipart_receive(TransIdList, Context, _, Req) ->
+    case recv_asyncs_minimal(Context, TransIdList) of
+        {ok, ResponseList} ->
+            handle_request_multipart_receive_results(ResponseList,
+                                                     [], [], Req);
+        {error, timeout} ->
+            {{cowboy_error, timeout}, Req}
     end.
 
 handle_response(NameIncoming, HeadersOutgoing0, Response,
                 ReqN, OutputType, ContentTypeForced,
                 ContentTypeLookup) ->
     ResponseBinary = if
-        OutputType =:= list, is_list(Response) ->
-            erlang:list_to_binary(Response);
-        OutputType =:= internal; OutputType =:= external;
-        OutputType =:= binary; is_binary(Response) ->
-            Response
+        (((OutputType =:= external) orelse
+          (OutputType =:= internal)) andalso
+         (is_binary(Response) orelse
+          is_list(Response))) orelse % iolist
+        ((OutputType =:= binary) andalso
+         is_binary(Response)) ->
+            Response;
+        ((OutputType =:= list) andalso
+         is_list(Response)) ->
+            erlang:list_to_binary(Response)
     end,
     {HttpCode, HeadersOutgoingN} = case lists:keytake(<<"status">>, 1,
                                                       HeadersOutgoing0) of
@@ -830,20 +995,16 @@ handle_response(NameIncoming, HeadersOutgoing0, Response,
                     case cloudi_x_trie:find(Extension, ContentTypeLookup) of
                         error ->
                             [{<<"content-disposition">>,
-                              erlang:iolist_to_binary(["attachment; "
-                                                       "filename=\"",
-                                                       NameIncoming,
-                                                       "\""])},
+                              ["attachment; filename=\"",
+                               filename:basename(NameIncoming), "\""]},
                              {<<"content-type">>,
                               <<"application/octet-stream">>}];
                         {ok, {request, ContentType}} ->
                             [{<<"content-type">>, ContentType}];
                         {ok, {attachment, ContentType}} ->
                             [{<<"content-disposition">>,
-                              erlang:iolist_to_binary(["attachment; "
-                                                       "filename=\"",
-                                                       NameIncoming,
-                                                       "\""])},
+                              ["attachment; filename=\"",
+                               filename:basename(NameIncoming), "\""]},
                              {<<"content-type">>, ContentType}]
                     end
             end
@@ -879,7 +1040,20 @@ service_name_incoming_merge({ClientIpAddr, _ClientPort}, undefined, PathRaw) ->
 service_name_incoming_merge({ClientIpAddr, _ClientPort}, HostRaw, PathRaw) ->
     cloudi_ip_address:to_string(ClientIpAddr) ++
     erlang:binary_to_list(<<$/, HostRaw/binary, PathRaw/binary>>).
-    
+
+websocket_terminate_check(<<>>) ->
+    false;
+websocket_terminate_check(ResponseInfo) ->
+    case lists:keyfind(<<"connection">>, 1,
+                       headers_external_outgoing(ResponseInfo)) of
+        {<<"connection">>, <<"close">>} ->
+            true;
+        {<<"connection">>, _} ->
+            false;
+        false ->
+            false
+    end.
+
 process_queue(Req,
               #cowboy_state{websocket_state =
                   #websocket_state{

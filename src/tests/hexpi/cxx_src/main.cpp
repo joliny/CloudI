@@ -68,7 +68,6 @@ class OutputData
         int m_error;
 };
 
-
 class Input
 {
     public:

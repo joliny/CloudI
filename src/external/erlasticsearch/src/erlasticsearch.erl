@@ -46,6 +46,7 @@
 
 % Doc CRUD
 -export([insert_doc/5, insert_doc/6]).
+-export([update_doc/5, update_doc/6]).
 -export([get_doc/4, get_doc/5]).
 -export([mget_doc/2, mget_doc/3, mget_doc/4]).
 -export([delete_doc/4, delete_doc/5]).
@@ -322,6 +323,16 @@ insert_doc(Destination, Index, Type, Id, Doc) when is_binary(Index) andalso is_b
 -spec insert_doc(destination(), index(), type(), id(), doc(), params()) -> response().
 insert_doc(Destination, Index, Type, Id, Doc, Params) when is_binary(Index) andalso is_binary(Type) andalso (is_binary(Doc) orelse is_list(Doc)) andalso is_list(Params) ->
     route_call(Destination, {insert_doc, Index, Type, Id, Doc, Params}, infinity).
+
+%% @equiv update_doc(Destination, Index, Type, Id, Doc, []).
+-spec update_doc(destination(), index(), type(), id(), doc()) -> response().
+update_doc(Destination, Index, Type, Id, Doc) when is_binary(Index) andalso is_binary(Type) andalso (is_binary(Doc) orelse is_list(Doc)) ->
+    update_doc(Destination, Index, Type, Id, Doc, []).
+
+%% @doc Insert a doc into the ElasticSearch cluster
+-spec update_doc(destination(), index(), type(), id(), doc(), params()) -> response().
+update_doc(Destination, Index, Type, Id, Doc, Params) when is_binary(Index) andalso is_binary(Type) andalso (is_binary(Doc) orelse is_list(Doc)) andalso is_list(Params) ->
+    route_call(Destination, {update_doc, Index, Type, Id, Doc, Params}, infinity).
 
 %% @doc Checks to see if the doc exists
 -spec is_doc(destination(), index(), type(), id()) -> response().
@@ -622,6 +633,11 @@ handle_call({_Request = insert_doc, Index, Type, Id, Doc, Params}, _From, State 
     {Connection1, Response} = process_request(Connection0, RestRequest, State),
     {reply, Response, State#state{connection = Connection1}};
 
+handle_call({_Request = update_doc, Index, Type, Id, Doc, Params}, _From, State = #state{connection = Connection0}) ->
+    RestRequest = rest_request_update_doc(Index, Type, Id, Doc, Params),
+    {Connection1, Response} = process_request(Connection0, RestRequest, State),
+    {reply, Response, State#state{connection = Connection1}};
+
 handle_call({_Request = get_doc, Index, Type, Id, Params}, _From, State = #state{connection = Connection0}) ->
     RestRequest = rest_request_get_doc(Index, Type, Id, Params),
     {Connection1, Response} = process_request(Connection0, RestRequest, State),
@@ -760,18 +776,35 @@ set_env(Key, Value) ->
     application:set_env(?APP, Key, Value).
 
 %% @doc Process the request over thrift
--spec process_request(connection(), request(), #state{}) -> {connection(), response()}.
-process_request(undefined, Request, State = #state{connection_options = ConnectionOptions,
+%%      In case the network blipped and the thrift connection vanishes,
+%%      this will retry the request (w/ a new thrift connection)
+%%      before choking
+-spec process_request(connection(), rest_request(), #state{}) -> {connection(), response()}.
+process_request(Connection, Request, State) ->
+    try process_request_1(_Retry = true, Connection, Request, State)
+    catch
+        Exception:Reason ->
+            case {Exception, Reason} of
+                {throw, {retry_request, true}} ->
+                    process_request_1(false, undefined, Request, State);
+                _ ->
+                    {undefined, ?CONNECTION_REFUSED}
+            end
+    end.
+
+%% @doc Actually perform the request
+-spec process_request_1(boolean(), connection(), rest_request(), #state{}) -> {connection(), response()}.
+process_request_1(Retry, undefined, Request, State = #state{connection_options = ConnectionOptions,
                                                    binary_response = BinaryResponse}) ->
     Connection = connection(ConnectionOptions),
-    {Connection1, RestResponse} = do_request(Connection, {'execute', [Request]}, State),
+    {Connection1, RestResponse} = do_request(Retry, Connection, {'execute', [Request]}, State),
     {Connection1, process_response(BinaryResponse, RestResponse)};
-process_request(Connection, Request, State = #state{binary_response = BinaryResponse}) ->
-    {Connection1, RestResponse} = do_request(Connection, {'execute', [Request]}, State),
+process_request_1(Retry, Connection, Request, State = #state{binary_response = BinaryResponse}) ->
+    {Connection1, RestResponse} = do_request(Retry, Connection, {'execute', [Request]}, State),
     {Connection1, process_response(BinaryResponse, RestResponse)}.
 
--spec do_request(connection(), {'execute', [request()]}, #state{}) -> {connection(), response()}.
-do_request(Connection, {Function, Args}, _State) ->
+-spec do_request(boolean(), connection(), {'execute', [rest_request()]}, #state{}) -> {connection(),  {ok, rest_response()} | error() | exception()}.
+do_request(Retry, Connection, {Function, Args}, _State) ->
     Args2 =
         case Args of
             [#restRequest{body=Body}] when is_binary(Body) ->
@@ -790,10 +823,14 @@ do_request(Connection, {Function, Args}, _State) ->
                 {throw, {Connection1, Response = {exception, _}}} ->
                     {Connection1, Response};
                 % Thrift client closes the connection
-                {error, {case_clause,{error, closed}}} ->
-                    {undefined, {error, badarg}};
+                {error, {case_clause, {error, closed}}} ->
+                    if Retry =:= false -> {undefined, ?CONNECTION_REFUSED};
+                        true -> throw({retry_request, Retry})
+                    end;
                 {error, {case_clause,{error, econnrefused}}} ->
-                    {undefined, {error, econnrefused}};
+                    if Retry =:= false -> {undefined, ?CONNECTION_REFUSED};
+                        true -> throw({retry_request, Retry})
+                    end;
                 {error, badarg} ->
                     {Connection, {error, badarg}}
 
@@ -916,6 +953,16 @@ rest_request_insert_doc(Index, Type, Id, Doc, Params) when is_binary(Index) anda
                                                       is_list(Params) ->
     Uri = make_uri([Index, Type, Id], Params),
     #restRequest{method = ?elasticsearch_Method_PUT,
+                 uri = Uri,
+                 body = Doc}.
+
+rest_request_update_doc(Index, Type, Id, Doc, Params) when is_binary(Index) andalso
+                                                      is_binary(Type) andalso
+                                                      is_binary(Id) andalso
+                                                      (is_binary(Doc) orelse is_list(Doc)) andalso
+                                                      is_list(Params) ->
+    Uri = make_uri([Index, Type, Id, ?UPDATE], Params),
+    #restRequest{method = ?elasticsearch_Method_POST,
                  uri = Uri,
                  body = Doc}.
 

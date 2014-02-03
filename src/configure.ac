@@ -1,7 +1,7 @@
 #-*-Mode:autoconf;coding:utf-8;tab-width:4;c-basic-offset:4;indent-tabs-mode:()-*-
 # ex: set ft=config fenc=utf-8 sts=4 ts=4 sw=4 et:
 
-AC_INIT([CloudI], [1.3.0], [mjtruog at gmail dot com],
+AC_INIT([CloudI], [1.3.1], [mjtruog at gmail dot com],
     [cloudi], [http://cloudi.org/])
 
 # paths to check for installations that are not standard but typically used
@@ -21,7 +21,7 @@ AC_PREREQ([2.59])
 AC_CONFIG_AUX_DIR(config)
 AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_MACRO_DIR([m4])
-AM_INIT_AUTOMAKE([1.10 no-define no-dependencies])
+AM_INIT_AUTOMAKE([1.10 no-define no-dependencies foreign])
 AC_PROG_MKDIR_P
 AC_PROG_CC
 AC_PROG_CXX
@@ -30,6 +30,7 @@ AC_PROG_LIBTOOL
 AM_PROG_CC_C_O
 AX_CLOCK_GETTIME
 
+# now in autoconf 2.69
 AC_SUBST(abs_top_srcdir, [`cd $srcdir; pwd`])
 AC_SUBST(abs_top_builddir, [`pwd`])
 
@@ -57,16 +58,31 @@ AC_SUBST(CLOUDI_TMP_BIN_SCRIPT,
          m4_maketemp(/tmp/cloudi_tmp_bin_script_XXXXXX))
 
 # c++ boost checks
-AX_BOOST_BASE([1.36], ,
-    [AC_MSG_ERROR([Boost >= 1.36 not found, see http://boost.org/])])
+AX_BOOST_BASE([1.40], ,
+    [AC_MSG_ERROR([Boost >= 1.40 not found, see http://boost.org/])])
 AX_BOOST_THREAD
 AX_BOOST_SYSTEM
+AX_BOOST_CHECK_HEADER(boost/exception/all.hpp, ,
+    [AC_MSG_ERROR([boost::exception not found])], ,
+    $PATHS_NONSYSTEM_INC)
 AX_BOOST_CHECK_HEADER(boost/preprocessor.hpp, ,
     [AC_MSG_ERROR([boost::preprocessor not found])], ,
     $PATHS_NONSYSTEM_INC)
 AX_BOOST_CHECK_HEADER(boost/unordered_map.hpp, ,
     [AC_MSG_ERROR([boost::unordered_map not found])], ,
     $PATHS_NONSYSTEM_INC)
+# c++ backtrace check for adding exception information
+AC_ARG_WITH([cxx-backtrace],
+    [AS_HELP_STRING([--with-cxx-backtrace@<:@=ARG@:>@],
+        [the C++ CloudI API will provide the backtrace from
+         CloudI::API::backtrace() (ARG=yes),
+         or will not include backtrace support (ARG=no)
+         @<:@ARG=no@:>@ ])],
+    [
+    if test "x$withval" = "xyes"; then
+        AX_BACKTRACE()
+    fi
+    ])
 
 # java checks
 AC_SUBST(javadir, ["$datarootdir/java"])
@@ -165,6 +181,32 @@ AX_GMP($PATHS_NONSYSTEM_INC, $PATHS_NONSYSTEM_LIB)
 AX_ZEROMQ($PATHS_NONSYSTEM_INC, $PATHS_NONSYSTEM_LIB)
 AX_ZEROMQ_ERLZMQ
 
+# service Erlang application
+AC_ARG_WITH([service],
+    [AS_HELP_STRING([--with-service@<:@=ARG@:>@],
+        [include the service Erlang application (ARG=yes),
+         or exclude the service Erlang application to avoid module name
+         conflicts with external modules that use the service prefix (ARG=no)
+         @<:@ARG=yes@:>@ ])],
+    [
+    if test "x$withval" = "xno"; then
+        want_service="no"
+    elif test "x$withval" = "xyes"; then
+        want_service="yes"
+    else
+        want_service="yes"
+    fi
+    ],
+    [want_service="yes"])
+if test "x$want_service" = "xyes"; then
+    SERVICE_RELTOOL="{app, service, @<:@{incl_cond, include}, {mod_cond, all}, {app_file, keep}@:>@},"
+    SERVICE_APPCONF="service,"
+    SERVICE_PATH=',"lib/service"'
+    AC_SUBST(SERVICE_RELTOOL)
+    AC_SUBST(SERVICE_APPCONF)
+    AC_SUBST(SERVICE_PATH)
+fi
+
 AC_CONFIG_FILES([
     cloudi.conf
     rebar_src.config
@@ -184,11 +226,14 @@ AC_CONFIG_FILES([
     lib/cloudi_service_http_cowboy/src/cloudi_service_http_cowboy.app.src
     lib/cloudi_service_http_elli/src/cloudi_service_http_elli.app.src
     lib/cloudi_service_map_reduce/src/cloudi_service_map_reduce.app.src
+    lib/cloudi_service_quorum/src/cloudi_service_quorum.app.src
+    lib/cloudi_service_router/src/cloudi_service_router.app.src
     lib/cloudi_service_tcp/src/cloudi_service_tcp.app.src
     lib/cloudi_service_timers/src/cloudi_service_timers.app.src
     lib/cloudi_service_udp/src/cloudi_service_udp.app.src
     lib/cloudi_service_work_manager/src/cloudi_service_work_manager.app.src
     lib/cloudi_service_zeromq/src/cloudi_service_zeromq.app.src
+    lib/service/src/service.app.src
     Makefile
     api/Makefile
     api/c/Makefile

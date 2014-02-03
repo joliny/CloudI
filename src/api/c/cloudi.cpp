@@ -51,12 +51,102 @@
 #include <ei.h>
 #include <boost/shared_ptr.hpp>
 #include <boost/unordered_map.hpp>
+#include <boost/exception/all.hpp>
+#define BACKTRACE_FRAMES 32
+#define BACKTRACE_FRAME_OFFSET 2
+#if defined(BACKTRACE_USE_BACKWARD)
+#include <backward.hpp>
+#elif defined(BACKTRACE_USE_BOOSTER)
+#include <booster/backtrace.h>
+#endif
 #include <string>
 #include <list>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include "assert.hpp"
+
+extern "C" {
+
+static std::string backtrace_string()
+{
+#if defined(BACKTRACE_USE_BACKWARD)
+    backward::StackTrace st;
+    st.load_here(BACKTRACE_FRAMES);
+    std::ostringstream result;
+    backward::TraceResolver  resolver;
+    result << "trace (most recent call last)";
+    unsigned int const thread_id = st.thread_id();
+    if (thread_id)
+    {
+        result << " in thread " << thread_id << ":" << std::endl;
+    }
+    else
+    {
+        result << ":" << std::endl;
+    }
+    resolver.load_stacktrace(st);
+    for (size_t i = BACKTRACE_FRAME_OFFSET; i < st.size(); ++i)
+    {
+        backward::ResolvedTrace const & trace = resolver.resolve(st[i]);
+        bool indented = true;
+
+        result << "#" <<
+            std::setfill(' ') << std::setw(2) << std::left <<
+            std::dec << (trace.idx - BACKTRACE_FRAME_OFFSET) << " ";
+        if (trace.source.filename.empty())
+        {
+            result <<
+                std::setfill(' ') << std::setw(18) << std::right <<
+                std::hex << trace.addr << " in " <<
+                trace.object_function << std::endl << 
+                "   at " << trace.object_filename << std::endl;
+            indented = false;
+        }
+        for (size_t j = 0; j < trace.inliners.size(); ++j)
+        {
+            if (not indented)
+                result << "    ";
+            backward::ResolvedTrace::SourceLoc const & location =
+                trace.inliners[j];
+            result << 
+                "     (inlined)     "
+                "in " << location.function << std::endl << 
+                "   at " << location.filename << ":" <<
+                std::dec << location.line << std::endl;
+            indented = false;
+        }
+        if (not trace.source.filename.empty())
+        {
+            if (not indented)
+                result << "    ";
+            result <<
+                std::setfill(' ') << std::setw(18) << std::right <<
+                std::hex << trace.addr << " in " <<
+                trace.source.function << std::endl <<
+                "   at " << trace.source.filename << ":" <<
+                std::dec << trace.source.line << std::endl;
+        }
+    }
+    return result.str();
+#elif defined(BACKTRACE_USE_BOOSTER)
+    booster::backtrace b(BACKTRACE_FRAMES);
+    std::ostringstream result;
+    result << "trace (most recent call last):" << std::endl;
+    for (unsigned int i = BACKTRACE_FRAME_OFFSET; i < b.stack_size(); ++i)
+    {
+        result << "#" <<
+            std::setfill(' ') << std::setw(2) << std::left <<
+            std::dec << (i - BACKTRACE_FRAME_OFFSET) << " ";
+        b.trace_line(i, result);
+    }
+    return result.str();
+#else
+    return std::string("");
+#endif
+}
+
+}
 
 namespace
 {
@@ -424,6 +514,12 @@ static void exit_handler()
     std::clog.flush();
 }
 
+static void exception_unknown()
+{
+    std::cerr << backtrace_string();
+    ::abort();
+}
+
 static int poll_request(cloudi_instance_t * p,
                         int timeout,
                         int external);
@@ -467,10 +563,12 @@ int cloudi_initialize(cloudi_instance_t * p,
     p->buffer_recv = new buffer_t(32768, CLOUDI_MAX_BUFFERSIZE);
     p->buffer_recv_index = 0;
     p->buffer_call = new buffer_t(32768, CLOUDI_MAX_BUFFERSIZE);
+    p->poll_timer = new timer();
     p->request_timer = new timer();
     p->prefix = 0;
 
     ::atexit(&exit_handler);
+    std::set_terminate(exception_unknown);
 
     // attempt initialization
     buffer_t & buffer = *reinterpret_cast<buffer_t *>(p->buffer_send);
@@ -506,9 +604,10 @@ void cloudi_destroy(cloudi_instance_t * p)
         delete reinterpret_cast<buffer_t *>(p->buffer_send);
         delete reinterpret_cast<buffer_t *>(p->buffer_recv);
         delete reinterpret_cast<buffer_t *>(p->buffer_call);
+        delete reinterpret_cast<timer *>(p->poll_timer);
         delete reinterpret_cast<timer *>(p->request_timer);
         if (p->prefix)
-            delete p->prefix;
+            delete [] p->prefix;
     }
 }
 
@@ -734,15 +833,19 @@ static int cloudi_forward_(cloudi_instance_t * p,
     int index = 0;
     if (p->use_header)
         index = 4;
-    if (p->request_timeout_adjustment)
+    if (p->request_timeout_adjustment &&
+        timeout == p->request_timeout)
     {
         timer & request_timer = *reinterpret_cast<timer *>(p->request_timer);
-        int32_t const elapsed =
-            static_cast<int32_t>(request_timer.elapsed() * 1000.0);
-        if (elapsed > 0 && timeout == p->request_timeout)
+        uint32_t const elapsed = static_cast<uint32_t>(
+            std::max(0, static_cast<int>(request_timer.elapsed() * 1000.0)));
+        if (elapsed > timeout)
         {
-            timeout = static_cast<uint32_t>(
-                std::max(0, static_cast<int32_t>(timeout) - elapsed));
+            timeout = 0;
+        }
+        else
+        {
+            timeout -= elapsed;
         }
     }
     if (ei_encode_version(buffer.get<char>(), &index))
@@ -880,9 +983,9 @@ static int cloudi_return_(cloudi_instance_t * p,
                           char const * const name,
                           char const * const pattern,
                           void const * const response_info,
-                          uint32_t const response_info_size,
+                          uint32_t response_info_size,
                           void const * const response,
-                          uint32_t const response_size,
+                          uint32_t response_size,
                           uint32_t timeout,
                           char const * const trans_id,
                           char const * const pid,
@@ -892,15 +995,21 @@ static int cloudi_return_(cloudi_instance_t * p,
     int index = 0;
     if (p->use_header)
         index = 4;
-    if (p->request_timeout_adjustment)
+    if (p->request_timeout_adjustment &&
+        timeout == p->request_timeout)
     {
         timer & request_timer = *reinterpret_cast<timer *>(p->request_timer);
-        int32_t const elapsed =
-            static_cast<int32_t>(request_timer.elapsed() * 1000.0);
-        if (elapsed > 0 && timeout == p->request_timeout)
+        uint32_t const elapsed = static_cast<uint32_t>(
+            std::max(0, static_cast<int>(request_timer.elapsed() * 1000.0)));
+        if (elapsed > timeout)
         {
-            timeout = static_cast<uint32_t>(
-                std::max(0, static_cast<int32_t>(timeout) - elapsed));
+            response_info_size = 0;
+            response_size = 0;
+            timeout = 0;
+        }
+        else
+        {
+            timeout -= elapsed;
         }
     }
     if (ei_encode_version(buffer.get<char>(), &index))
@@ -1177,13 +1286,13 @@ static void callback(cloudi_instance_t * p,
             assert(false);
             return;
         }
+        catch (boost::exception const & e)
+        {
+            std::cerr << boost::diagnostic_information(e);
+        }
         catch (std::exception const & e)
         {
-            std::cerr << "exception: " << e.what() << std::endl;
-        }
-        catch (...)
-        {
-            std::cerr << "exception: (unknown)" << std::endl;
+            std::cerr << boost::diagnostic_information(e);
         }
         try
         {
@@ -1194,7 +1303,6 @@ static void callback(cloudi_instance_t * p,
         }
         catch (CloudI::API::return_async_exception const & e)
         {
-            assert(result == cloudi_success);
             return;
         }
         assert(false);
@@ -1226,13 +1334,13 @@ static void callback(cloudi_instance_t * p,
         {
             return;
         }
+        catch (boost::exception const & e)
+        {
+            std::cerr << boost::diagnostic_information(e);
+        }
         catch (std::exception const & e)
         {
-            std::cerr << "exception: " << e.what() << std::endl;
-        }
-        catch (...)
-        {
-            std::cerr << "exception: (unknown)" << std::endl;
+            std::cerr << boost::diagnostic_information(e);
         }
         try
         {
@@ -1243,7 +1351,6 @@ static void callback(cloudi_instance_t * p,
         }
         catch (CloudI::API::return_sync_exception const & e)
         {
-            assert(result == cloudi_success);
             return;
         }
         assert(false);
@@ -1305,6 +1412,11 @@ static int poll_request(cloudi_instance_t * p,
     buffer_t & buffer_recv = *reinterpret_cast<buffer_t *>(p->buffer_recv);
     buffer_t & buffer_call = *reinterpret_cast<buffer_t *>(p->buffer_call);
 
+    timer & poll_timer = *reinterpret_cast<timer *>(p->poll_timer);
+    if (timeout > 0)
+    {
+        poll_timer.restart();
+    }
     struct pollfd fds[1] = {{p->fd_in, POLLIN | POLLPRI, 0}};
     int count = ::poll(fds, 1, timeout);
     if (count == 0)
@@ -1362,8 +1474,8 @@ static int poll_request(cloudi_instance_t * p,
                 store_incoming_uint32(buffer_call, index, request_size);
                 char * request = &buffer_call[index];
                 index += request_size + 1;
-                uint32_t timeout;
-                store_incoming_uint32(buffer_call, index, timeout);
+                uint32_t request_timeout;
+                store_incoming_uint32(buffer_call, index, request_timeout);
                 int8_t priority;
                 store_incoming_int8(buffer_call, index, priority);
                 char * trans_id = &buffer_call[index];
@@ -1377,8 +1489,8 @@ static int poll_request(cloudi_instance_t * p,
                 p->buffer_recv_index = 0;
                 callback(p, command, name, pattern,
                          request_info, request_info_size,
-                         request, request_size,
-                         timeout, priority, trans_id, pid, pid_size);
+                         request, request_size, request_timeout,
+                         priority, trans_id, pid, pid_size);
                 break;
             }
             case MESSAGE_RECV_ASYNC:
@@ -1449,6 +1561,19 @@ static int poll_request(cloudi_instance_t * p,
             }
         }
 
+        if (timeout > 0)
+        {
+            timeout -= std::min(static_cast<int>(::round(poll_timer.elapsed() *
+                                                         1000.0)), timeout);
+        }
+        if (timeout == 0)
+        {
+            return cloudi_timeout;
+        }
+        else if (timeout > 0)
+        {
+            poll_timer.restart();
+        }
         fds[0].revents = 0;
         count = ::poll(fds, 1, timeout);
         if (count == 0)
@@ -1477,7 +1602,7 @@ static char const ** binary_key_value_parse(void const * const binary,
     realloc_ptr<char const *> result(16, 8192);
     result[0] = p;
     size_t i = 1;
-    for (size_t binary_i = 1; binary_i < binary_size; ++binary_i)
+    for (size_t binary_i = 1; binary_i < binary_size - 1; ++binary_i)
     {
         if (p[binary_i] == '\0')
         {
@@ -1955,6 +2080,11 @@ char const ** API::info_key_value_parse(void const * const message_info,
 void API::info_key_value_destroy(char const ** p) const
 {
     cloudi_info_key_value_destroy(p);
+}
+
+std::string API::backtrace()
+{
+    return backtrace_string();
 }
 
 } // namespace CloudI

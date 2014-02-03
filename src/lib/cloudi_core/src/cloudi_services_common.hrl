@@ -47,8 +47,7 @@
 % cloudi_services_external.erl may be used (to avoid GC delays)
 
 -compile({nowarn_unused_function,
-          [{duo_recv_timeout_start, 5},
-           {recv_async_select_random, 1},
+          [{recv_async_select_random, 1},
            {recv_async_select_oldest, 1}]}).
 
 -define(CATCH_EXIT(F),
@@ -222,14 +221,12 @@ destination_all(DestRefresh, _, Name, Pid, Groups, _)
           DestRefresh =:= lazy_oldest) ->
     cloudi_x_cpg_data:get_members(Name, Pid, Groups);
 
-destination_all(DestRefresh, _, Name, Pid, Groups, _)
-    when is_list(Name),
-         DestRefresh =:= lazy_local ->
+destination_all(lazy_local, _, Name, Pid, Groups, _)
+    when is_list(Name) ->
     cloudi_x_cpg_data:get_local_members(Name, Pid, Groups);
 
-destination_all(DestRefresh, _, Name, Pid, Groups, _)
-    when is_list(Name),
-         DestRefresh =:= lazy_remote ->
+destination_all(lazy_remote, _, Name, Pid, Groups, _)
+    when is_list(Name) ->
     cloudi_x_cpg_data:get_remote_members(Name, Pid, Groups);
 
 destination_all(DestRefresh, _, _, _, _, Timeout)
@@ -252,14 +249,12 @@ destination_all(DestRefresh, Scope, Name, Pid, _, Timeout)
           DestRefresh =:= immediate_oldest) ->
     ?CATCH_EXIT(cloudi_x_cpg:get_members(Scope, Name, Pid, Timeout));
 
-destination_all(DestRefresh, Scope, Name, Pid, _, Timeout)
-    when is_list(Name),
-         DestRefresh =:= immediate_local ->
+destination_all(immediate_local, Scope, Name, Pid, _, Timeout)
+    when is_list(Name) ->
     ?CATCH_EXIT(cloudi_x_cpg:get_local_members(Scope, Name, Pid, Timeout));
 
-destination_all(DestRefresh, Scope, Name, Pid, _, Timeout)
-    when is_list(Name),
-         DestRefresh =:= immediate_remote ->
+destination_all(immediate_remote, Scope, Name, Pid, _, Timeout)
+    when is_list(Name) ->
     ?CATCH_EXIT(cloudi_x_cpg:get_remote_members(Scope, Name, Pid, Timeout));
 
 destination_all(DestRefresh, _, _, _, _, _) ->
@@ -267,57 +262,157 @@ destination_all(DestRefresh, _, _, _, _, _) ->
                [DestRefresh]),
     erlang:exit(badarg).
 
-send_async_timeout_start(Timeout, TransId,
-                         #state{send_timeouts = SendTimeouts} = State)
+send_async_timeout_start(Timeout, TransId, Pid,
+                         #state{dispatcher = Dispatcher,
+                                send_timeouts = SendTimeouts,
+                                send_timeout_monitors =
+                                    SendTimeoutMonitors,
+                                options = #config_service_options{
+                                    request_timeout_immediate_max =
+                                        RequestTimeoutImmediateMax}} = State)
+    when is_integer(Timeout), is_binary(TransId), is_pid(Pid),
+         Timeout > RequestTimeoutImmediateMax ->
+    NewSendTimeoutMonitors = case dict:find(Pid, SendTimeoutMonitors) of
+        {ok, {MonitorRef, TransIdList}} ->
+            dict:store(Pid,
+                       {MonitorRef,
+                        lists:umerge(TransIdList, [TransId])},
+                       SendTimeoutMonitors);
+        error ->
+            MonitorRef = erlang:monitor(process, Pid),
+            dict:store(Pid, {MonitorRef, [TransId]}, SendTimeoutMonitors)
+    end,
+    State#state{
+        send_timeouts = dict:store(TransId,
+            {passive, Pid,
+             erlang:send_after(Timeout, Dispatcher,
+                               {'cloudi_service_send_async_timeout', TransId})},
+            SendTimeouts),
+        send_timeout_monitors = NewSendTimeoutMonitors};
+
+send_async_timeout_start(Timeout, TransId, _Pid,
+                         #state{dispatcher = Dispatcher,
+                                send_timeouts = SendTimeouts} = State)
     when is_integer(Timeout), is_binary(TransId) ->
     State#state{
-        send_timeouts = dict:store(TransId, {passive,
-            erlang:send_after(Timeout, self(),
-                              {'cloudi_service_send_async_timeout', TransId})},
+        send_timeouts = dict:store(TransId,
+            {passive, undefined,
+             erlang:send_after(Timeout, Dispatcher,
+                               {'cloudi_service_send_async_timeout', TransId})},
             SendTimeouts)}.
 
-send_sync_timeout_start(Timeout, TransId, Client,
-                        #state{send_timeouts = SendTimeouts} = State)
+send_sync_timeout_start(Timeout, TransId, Pid, Client,
+                        #state{dispatcher = Dispatcher,
+                               send_timeouts = SendTimeouts,
+                               send_timeout_monitors =
+                                   SendTimeoutMonitors,
+                               options = #config_service_options{
+                                   request_timeout_immediate_max =
+                                       RequestTimeoutImmediateMax}} = State)
+    when is_integer(Timeout), is_binary(TransId), is_pid(Pid),
+         Timeout > RequestTimeoutImmediateMax ->
+    NewSendTimeoutMonitors = case dict:find(Pid, SendTimeoutMonitors) of
+        {ok, {MonitorRef, TransIdList}} ->
+            dict:store(Pid,
+                       {MonitorRef,
+                        lists:umerge(TransIdList, [TransId])},
+                       SendTimeoutMonitors);
+        error ->
+            MonitorRef = erlang:monitor(process, Pid),
+            dict:store(Pid, {MonitorRef, [TransId]}, SendTimeoutMonitors)
+    end,
+    State#state{
+        send_timeouts = dict:store(TransId,
+            {Client, Pid,
+             erlang:send_after(Timeout, Dispatcher,
+                               {'cloudi_service_send_sync_timeout', TransId})},
+            SendTimeouts),
+        send_timeout_monitors = NewSendTimeoutMonitors};
+
+send_sync_timeout_start(Timeout, TransId, _Pid, Client,
+                        #state{dispatcher = Dispatcher,
+                               send_timeouts = SendTimeouts} = State)
     when is_integer(Timeout), is_binary(TransId) ->
     State#state{
-        send_timeouts = dict:store(TransId, {Client,
-            erlang:send_after(Timeout, self(),
-                              {'cloudi_service_send_sync_timeout', TransId})},
+        send_timeouts = dict:store(TransId,
+            {Client, undefined,
+             erlang:send_after(Timeout, Dispatcher,
+                               {'cloudi_service_send_sync_timeout', TransId})},
             SendTimeouts)}.
 
-send_timeout_end(TransId,
-                 #state{send_timeouts = SendTimeouts} = State)
+send_timeout_end(TransId, Pid,
+                 #state{send_timeouts = SendTimeouts,
+                        send_timeout_monitors = SendTimeoutMonitors} = State)
     when is_binary(TransId) ->
-    State#state{send_timeouts = dict:erase(TransId, SendTimeouts)}.
+    NewSendTimeoutMonitors = if
+        is_pid(Pid) ->
+            case dict:find(Pid, SendTimeoutMonitors) of
+                {ok, {MonitorRef, [TransId]}} ->
+                    erlang:demonitor(MonitorRef),
+                    dict:erase(Pid, SendTimeoutMonitors);
+                {ok, {MonitorRef, TransIdList}} ->
+                    dict:store(Pid,
+                               {MonitorRef,
+                                lists:delete(TransId, TransIdList)},
+                               SendTimeoutMonitors);
+                error ->
+                    SendTimeoutMonitors
+            end;
+        Pid =:= undefined ->
+            SendTimeoutMonitors
+    end,
+    State#state{send_timeouts = dict:erase(TransId, SendTimeouts),
+                send_timeout_monitors = NewSendTimeoutMonitors}.
 
-recv_timeout_start(Timeout, Priority, TransId, T,
-                   #state{recv_timeouts = RecvTimeouts,
-                          queued = Queue} = State)
-    when is_integer(Timeout), is_integer(Priority), is_binary(TransId) ->
-    State#state{
-        recv_timeouts = dict:store(TransId, erlang:send_after(Timeout, self(),
-                {'cloudi_service_recv_timeout', Priority, TransId}),
-            RecvTimeouts),
-        queued = cloudi_x_pqueue4:in(T, Priority, Queue)}.
-
-duo_recv_timeout_start(Timeout, Priority, TransId, T,
-                       #state_duo{duo_mode_pid = Self,
-                                  recv_timeouts = RecvTimeouts,
-                                  queued = Queue} = State)
-    when is_integer(Timeout), is_integer(Priority), is_binary(TransId) ->
-    State#state_duo{
-        recv_timeouts = dict:store(TransId, erlang:send_after(Timeout, Self,
-                {'cloudi_service_recv_timeout', Priority, TransId}),
-            RecvTimeouts),
-        queued = cloudi_x_pqueue4:in(T, Priority, Queue)}.
+send_timeout_dead(Pid,
+                  #state{dispatcher = Dispatcher,
+                         send_timeouts = SendTimeouts,
+                         send_timeout_monitors =
+                             SendTimeoutMonitors} = State)
+    when is_pid(Pid) ->
+    NewSendTimeouts = case dict:find(Pid, SendTimeoutMonitors) of
+        {ok, {_MonitorRef, TransIdList}} ->
+            lists:foldl(fun(TransId, D) ->
+                case dict:find(TransId, D) of
+                    {ok, {Type, _, Tref}}
+                    when Type =:= active; Type =:= passive ->
+                        case erlang:cancel_timer(Tref) of
+                            false ->
+                                ok;
+                            _ ->
+                                Dispatcher !
+                                    {'cloudi_service_send_async_timeout',
+                                     TransId}
+                        end,
+                        dict:store(TransId, {Type, undefined, Tref}, D);
+                    {ok, {Client, _, Tref}} ->
+                        case erlang:cancel_timer(Tref) of
+                            false ->
+                                ok;
+                            _ ->
+                                Dispatcher !
+                                    {'cloudi_service_send_sync_timeout',
+                                     TransId}
+                        end,
+                        dict:store(TransId, {Client, undefined, Tref}, D);
+                    error ->
+                        D
+                end
+            end, SendTimeouts, TransIdList);
+        error ->
+            SendTimeouts
+    end,
+    State#state{send_timeouts = NewSendTimeouts,
+                send_timeout_monitors = dict:erase(Pid, SendTimeoutMonitors)}.
 
 async_response_timeout_start(_, _, 0, _, State) ->
     State;
 
 async_response_timeout_start(ResponseInfo, Response, Timeout, TransId,
-                             #state{async_responses = AsyncResponses} = State)
+                             #state{dispatcher = Dispatcher,
+                                    async_responses = AsyncResponses} = State)
     when is_integer(Timeout), is_binary(TransId) ->
-    erlang:send_after(Timeout, self(),
+    erlang:send_after(Timeout, Dispatcher,
                       {'cloudi_service_recv_async_timeout', TransId}),
     State#state{async_responses = dict:store(TransId,
                                              {ResponseInfo, Response},
@@ -341,13 +436,13 @@ recv_async_select_oldest([{TransId, _} | L], Time0, TransIdCurrent) ->
             recv_async_select_oldest(L, Time0, TransIdCurrent)
     end.
 
-check_init(#config_service_options{
-               monkey_latency = false,
-               monkey_chaos = false} = ConfigOptions) ->
+check_init_send(#config_service_options{
+                    monkey_latency = false,
+                    monkey_chaos = false} = ConfigOptions) ->
     ConfigOptions;
-check_init(#config_service_options{
-               monkey_latency = MonkeyLatency,
-               monkey_chaos = MonkeyChaos} = ConfigOptions) ->
+check_init_send(#config_service_options{
+                    monkey_latency = MonkeyLatency,
+                    monkey_chaos = MonkeyChaos} = ConfigOptions) ->
     NewMonkeyLatency = if
         MonkeyLatency =/= false ->
             cloudi_runtime_testing:monkey_latency_init(MonkeyLatency);
@@ -364,13 +459,52 @@ check_init(#config_service_options{
         monkey_latency = NewMonkeyLatency,
         monkey_chaos = NewMonkeyChaos}.
 
-check_incoming(#config_service_options{
-                   monkey_latency = false,
-                   monkey_chaos = false} = ConfigOptions) ->
+check_init_receive(#config_service_options{
+                       count_process_dynamic = false,
+                       hibernate = Hibernate} = ConfigOptions)
+    when is_boolean(Hibernate) ->
     ConfigOptions;
-check_incoming(#config_service_options{
+check_init_receive(#config_service_options{
+                       count_process_dynamic = CountProcessDynamic,
+                       hibernate = Hibernate} = ConfigOptions) ->
+    NewCountProcessDynamic = if
+        CountProcessDynamic =/= false ->
+            cloudi_rate_based_configuration:
+            count_process_dynamic_init(CountProcessDynamic);
+        true ->
+            CountProcessDynamic
+    end,
+    NewHibernate = if
+        not is_boolean(Hibernate) ->
+            cloudi_rate_based_configuration:hibernate_init(Hibernate);
+        true ->
+            Hibernate
+    end,
+    ConfigOptions#config_service_options{
+        count_process_dynamic = NewCountProcessDynamic,
+        hibernate = NewHibernate}.
+
+check_incoming(_ServiceRequest,
+               #config_service_options{
+                   count_process_dynamic = false,
+                   monkey_latency = false,
+                   monkey_chaos = false,
+                   hibernate = Hibernate} = ConfigOptions)
+    when is_boolean(Hibernate) ->
+    ConfigOptions;
+check_incoming(ServiceRequest,
+               #config_service_options{
+                   count_process_dynamic = CountProcessDynamic,
                    monkey_latency = MonkeyLatency,
-                   monkey_chaos = MonkeyChaos} = ConfigOptions) ->
+                   monkey_chaos = MonkeyChaos,
+                   hibernate = Hibernate} = ConfigOptions) ->
+    NewCountProcessDynamic = if
+        (CountProcessDynamic =/= false), ServiceRequest ->
+            cloudi_rate_based_configuration:
+            count_process_dynamic_request(CountProcessDynamic);
+        true ->
+            CountProcessDynamic
+    end,
     NewMonkeyLatency = if
         MonkeyLatency =/= false ->
             cloudi_runtime_testing:monkey_latency_check(MonkeyLatency);
@@ -383,7 +517,15 @@ check_incoming(#config_service_options{
         true ->
             MonkeyChaos
     end,
+    NewHibernate = if
+        (not is_boolean(Hibernate)), ServiceRequest ->
+            cloudi_rate_based_configuration:hibernate_request(Hibernate);
+        true ->
+            Hibernate
+    end,
     ConfigOptions#config_service_options{
+        count_process_dynamic = NewCountProcessDynamic,
         monkey_latency = NewMonkeyLatency,
-        monkey_chaos = NewMonkeyChaos}.
+        monkey_chaos = NewMonkeyChaos,
+        hibernate = NewHibernate}.
 

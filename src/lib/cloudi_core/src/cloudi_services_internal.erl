@@ -10,7 +10,7 @@
 %%%
 %%% BSD LICENSE
 %%% 
-%%% Copyright (c) 2011-2013, Michael Truog <mjtruog at gmail dot com>
+%%% Copyright (c) 2011-2014, Michael Truog <mjtruog at gmail dot com>
 %%% All rights reserved.
 %%% 
 %%% Redistribution and use in source and binary forms, with or without
@@ -45,8 +45,8 @@
 %%% DAMAGE.
 %%%
 %%% @author Michael Truog <mjtruog [at] gmail (dot) com>
-%%% @copyright 2011-2013 Michael Truog
-%%% @version 1.3.0 {@date} {@time}
+%%% @copyright 2011-2014 Michael Truog
+%%% @version 1.3.1 {@date} {@time}
 %%%------------------------------------------------------------------------
 
 -module(cloudi_services_internal).
@@ -79,10 +79,11 @@
         % common elements for cloudi_services_common.hrl
         dispatcher,                    % self()
         send_timeouts = dict:new(),    % tracking for send timeouts
+        send_timeout_monitors = dict:new(),  % send timeouts destinations
         recv_timeouts = dict:new(),    % tracking for recv timeouts
         async_responses = dict:new(),  % tracking for async messages
         queue_requests = true,         % is the request pid busy?
-        queued = cloudi_x_pqueue4:new(),        % queued incoming messages
+        queued = cloudi_x_pqueue4:new(),     % queued incoming messages
         % unique state elements
         queued_info = queue:new(),     % queue process messages for service
         module,                        % service module
@@ -113,14 +114,10 @@
 % used when duo_mode is true
 -record(state_duo,
     {
-        % common elements for cloudi_services_common.hrl
         duo_mode_pid,                  % self()
-        unused_element1,               % (send_timeouts)
         recv_timeouts = dict:new(),    % tracking for recv timeouts
-        unused_element2,               % (async_responses)
         queue_requests = true,         % is the request pid busy?
-        queued = cloudi_x_pqueue4:new(),        % queued incoming messages
-        % unique state elements
+        queued = cloudi_x_pqueue4:new(),     % queued incoming messages
         queued_info = queue:new(),     % queue process messages for service
         module,                        % service module
         service_state,                 % service state
@@ -181,7 +178,7 @@ init([ProcessIndex, Module, Args, Timeout, Prefix,
           info_pid_options = InfoPidOptions} = ConfigOptions]) ->
     Dispatcher = self(),
     cloudi_x_quickrand:seed(),
-    NewConfigOptions = check_init(ConfigOptions),
+    NewConfigOptions = check_init_send(ConfigOptions),
     DuoModePid = if
         DuoMode =:= true ->
             proc_lib:spawn_opt(fun() ->
@@ -229,22 +226,40 @@ handle_call(self, _,
             #state{receiver_pid = ReceiverPid} = State) ->
     hibernate_check({reply, ReceiverPid, State});
 
+handle_call(dispatcher, _,
+            #state{dispatcher = Dispatcher} = State) ->
+    hibernate_check({reply, Dispatcher, State});
+
 handle_call({'subscribe', Pattern}, _,
             #state{prefix = Prefix,
                    receiver_pid = ReceiverPid,
                    options = #config_service_options{
+                       count_process_dynamic = CountProcessDynamic,
                        scope = Scope}} = State) ->
-    Result = cloudi_x_cpg:join(Scope, Prefix ++ Pattern,
-                               ReceiverPid, infinity),
+    Result = case cloudi_rate_based_configuration:
+                  count_process_dynamic_terminated(CountProcessDynamic) of
+        false ->
+            cloudi_x_cpg:join(Scope, Prefix ++ Pattern,
+                              ReceiverPid, infinity);
+        true ->
+            error
+    end,
     hibernate_check({reply, Result, State});
 
 handle_call({'unsubscribe', Pattern}, _,
             #state{prefix = Prefix,
                    receiver_pid = ReceiverPid,
                    options = #config_service_options{
+                       count_process_dynamic = CountProcessDynamic,
                        scope = Scope}} = State) ->
-    Result = cloudi_x_cpg:leave(Scope, Prefix ++ Pattern,
-                                ReceiverPid, infinity),
+    Result = case cloudi_rate_based_configuration:
+                  count_process_dynamic_terminated(CountProcessDynamic) of
+        false ->
+            cloudi_x_cpg:leave(Scope, Prefix ++ Pattern,
+                               ReceiverPid, infinity);
+        true ->
+            error
+    end,
     hibernate_check({reply, Result, State});
 
 handle_call({'get_pid', Name}, Client,
@@ -512,6 +527,31 @@ handle_call({'recv_async', Timeout, TransId, Consume}, Client,
             end
     end);
 
+handle_call({'recv_asyncs', Results, Consume}, Client,
+            #state{timeout_sync = TimeoutSync} = State) ->
+    handle_call({'recv_asyncs', TimeoutSync, Results, Consume},
+                Client, State);
+
+handle_call({'recv_asyncs', Timeout, Results, Consume}, Client,
+            #state{async_responses = AsyncResponses} = State) ->
+    hibernate_check(case recv_asyncs_pick(Results, Consume, AsyncResponses) of
+        {true, _, NewResults, NewAsyncResponses} ->
+            {reply, {ok, NewResults},
+             State#state{async_responses = NewAsyncResponses}};
+        {false, _, NewResults, NewAsyncResponses}
+            when Timeout >= ?RECV_ASYNC_INTERVAL ->
+            erlang:send_after(?RECV_ASYNC_INTERVAL, self(),
+                              {'cloudi_service_recv_asyncs_retry',
+                               Timeout - ?RECV_ASYNC_INTERVAL,
+                               NewResults, Consume, Client}),
+            {noreply, State#state{async_responses = NewAsyncResponses}};
+        {false, false, NewResults, NewAsyncResponses} ->
+            {reply, {ok, NewResults},
+             State#state{async_responses = NewAsyncResponses}};
+        {false, true, _, _} ->
+            {reply, {error, timeout}, State}
+    end);
+
 handle_call(prefix, _,
             #state{prefix = Prefix} = State) ->
     hibernate_check({reply, Prefix, State});
@@ -523,6 +563,65 @@ handle_call(timeout_async, _,
 handle_call(timeout_sync, _,
             #state{timeout_sync = TimeoutSync} = State) ->
     hibernate_check({reply, TimeoutSync, State});
+
+handle_call(priority_default, _,
+            #state{options = #config_service_options{
+                       priority_default = PriorityDefault}} = State) ->
+    hibernate_check({reply, PriorityDefault, State});
+
+handle_call(destination_refresh_immediate, _,
+            #state{dest_refresh = DestRefresh} = State) ->
+    Immediate = (DestRefresh =:= immediate_closest orelse
+                 DestRefresh =:= immediate_furthest orelse
+                 DestRefresh =:= immediate_random orelse
+                 DestRefresh =:= immediate_local orelse
+                 DestRefresh =:= immediate_remote orelse
+                 DestRefresh =:= immediate_newest orelse
+                 DestRefresh =:= immediate_oldest),
+    hibernate_check({reply, Immediate, State});
+
+handle_call(destination_refresh_lazy, _,
+            #state{dest_refresh = DestRefresh} = State) ->
+    Lazy = (DestRefresh =:= lazy_closest orelse
+            DestRefresh =:= lazy_furthest orelse
+            DestRefresh =:= lazy_random orelse
+            DestRefresh =:= lazy_local orelse
+            DestRefresh =:= lazy_remote orelse
+            DestRefresh =:= lazy_newest orelse
+            DestRefresh =:= lazy_oldest),
+    hibernate_check({reply, Lazy, State});
+
+handle_call({source_subscriptions, Pid}, _,
+            #state{options = #config_service_options{
+                       scope = Scope}} = State) ->
+    Subscriptions = cloudi_x_cpg:which_groups(Scope, Pid, infinity),
+    hibernate_check({reply, Subscriptions, State});
+
+handle_call(context_options, _,
+            #state{timeout_async = TimeoutAsync,
+                   timeout_sync = TimeoutSync,
+                   dest_refresh = DestRefresh,
+                   uuid_generator = UUID,
+                   cpg_data = Groups,
+                   options = #config_service_options{
+                       priority_default = PriorityDefault,
+                       dest_refresh_start = DestRefreshStart,
+                       dest_refresh_delay = DestRefreshDelay,
+                       scope = Scope}} = State) ->
+    Options = [{dest_refresh, DestRefresh},
+               {dest_refresh_start, DestRefreshStart},
+               {dest_refresh_delay, DestRefreshDelay},
+               {timeout_async, TimeoutAsync},
+               {timeout_sync, TimeoutSync},
+               {priority_default, PriorityDefault},
+               {uuid, UUID},
+               {groups, Groups},
+               {groups_scope, Scope}],
+    hibernate_check({reply, Options, State});
+
+handle_call(trans_id, _,
+            #state{uuid_generator = UUID} = State) ->
+    hibernate_check({reply, cloudi_x_uuid:get_v1(UUID), State});
 
 handle_call(Request, _, State) ->
     ?LOG_WARN("Unknown call \"~p\"", [Request]),
@@ -543,13 +642,17 @@ handle_info({'cloudi_service_init_execute', Args, Timeout,
         Timeout, ProcessDictionary, State),
     Result = Module:cloudi_service_init(Args, Prefix, DispatcherProxy),
     {NewProcessDictionary,
-     NewState} = cloudi_services_internal_init:stop_link(DispatcherProxy),
+     #state{options = ConfigOptions} = NewState} =
+        cloudi_services_internal_init:stop_link(DispatcherProxy),
     ok = cloudi_services_internal_init:process_dictionary_set(
         NewProcessDictionary),
     hibernate_check(case Result of
         {ok, ServiceState} ->
+            NewConfigOptions = check_init_receive(ConfigOptions),
             erlang:process_flag(trap_exit, true),
-            {noreply, process_queues(ServiceState, NewState)};
+            {noreply,
+             process_queues(ServiceState,
+                            NewState#state{options = NewConfigOptions})};
         {stop, Reason, ServiceState} ->
             {stop, Reason, NewState#state{service_state = ServiceState,
                                           duo_mode_pid = undefined}};
@@ -591,7 +694,12 @@ handle_info({'cloudi_service_request_failure',
     Reason = if
         Type =:= stop ->
             true = Stack =:= undefined,
-            ?LOG_ERROR("request stop ~p", [Error]),
+            if
+                Error =:= shutdown ->
+                    ?LOG_WARN("request stop shutdown", []);
+                true ->
+                    ?LOG_ERROR("request stop ~p", [Error])
+            end,
             Error;
         true ->
             ?LOG_ERROR("request ~p ~p~n~p", [Type, Error, Stack]),
@@ -600,8 +708,21 @@ handle_info({'cloudi_service_request_failure',
     {stop, Reason, State#state{service_state = NewServiceState}};
 
 handle_info({'cloudi_service_info_failure',
-             Reason, NewServiceState}, State) ->
-    ?LOG_ERROR("info stop ~p", [Reason]),
+             Type, Error, Stack, NewServiceState}, State) ->
+    Reason = if
+        Type =:= stop ->
+            true = Stack =:= undefined,
+            if
+                Error =:= shutdown ->
+                    ?LOG_WARN("info stop shutdown", []);
+                true ->
+                    ?LOG_ERROR("info stop ~p", [Error])
+            end,
+            Error;
+        true ->
+            ?LOG_ERROR("info ~p ~p~n~p", [Type, Error, Stack]),
+            {Type, {Error, Stack}}
+    end,
     {stop, Reason, State#state{service_state = NewServiceState}};
 
 handle_info({'EXIT', _, shutdown},
@@ -656,7 +777,7 @@ handle_info({'EXIT', InfoPid,
 
 handle_info({'EXIT', InfoPid,
              {'cloudi_service_info_failure',
-              _Reason, _NewServiceState} = Result},
+              _Type, _Error, _Stack, _NewServiceState} = Result},
             #state{info_pid = InfoPid} = State) ->
     handle_info(Result, State#state{info_pid = undefined});
 
@@ -674,7 +795,7 @@ handle_info({'EXIT', Pid, Reason}, State) ->
     ?LOG_ERROR("~p forced exit: ~p", [Pid, Reason]),
     {stop, Reason, State};
 
-handle_info({cloudi_x_cpg_data, Groups},
+handle_info({cloudi_cpg_data, Groups},
             #state{dest_refresh = DestRefresh,
                    options = ConfigOptions} = State) ->
     destination_refresh_start(DestRefresh, ConfigOptions),
@@ -844,6 +965,28 @@ handle_info({'cloudi_service_recv_async_retry',
             end
     end);
 
+handle_info({'cloudi_service_recv_asyncs_retry',
+             Timeout, Results, Consume, Client},
+            #state{async_responses = AsyncResponses} = State) ->
+    hibernate_check(case recv_asyncs_pick(Results, Consume, AsyncResponses) of
+        {true, _, NewResults, NewAsyncResponses} ->
+            gen_server:reply(Client, {ok, NewResults}),
+            {noreply, State#state{async_responses = NewAsyncResponses}};
+        {false, _, NewResults, NewAsyncResponses}
+            when Timeout >= ?RECV_ASYNC_INTERVAL ->
+            erlang:send_after(?RECV_ASYNC_INTERVAL, self(),
+                              {'cloudi_service_recv_asyncs_retry',
+                               Timeout - ?RECV_ASYNC_INTERVAL,
+                               NewResults, Consume, Client}),
+            {noreply, State#state{async_responses = NewAsyncResponses}};
+        {false, false, NewResults, NewAsyncResponses} ->
+            gen_server:reply(Client, {ok, NewResults}),
+            {noreply, State#state{async_responses = NewAsyncResponses}};
+        {false, true, _, _} ->
+            gen_server:reply(Client, {error, timeout}),
+            {noreply, State}
+    end);
+
 handle_info({'cloudi_service_send_async',
              Name, Pattern, RequestInfo, Request,
              Timeout, Priority, TransId, Source},
@@ -853,17 +996,19 @@ handle_info({'cloudi_service_send_async',
                    service_state = ServiceState,
                    request_pid = RequestPid,
                    options = ConfigOptions} = State) ->
-    NewConfigOptions = check_incoming(ConfigOptions),
-    hibernate_check({noreply, State#state{
-        queue_requests = true,
-        request_pid = handle_module_request_loop_pid(RequestPid,
-            {'cloudi_service_request_loop',
-             'send_async', Name, Pattern,
-             RequestInfo, Request,
-             Timeout, Priority, TransId, Source,
-             Module, Dispatcher, NewConfigOptions,
-             ServiceState}, NewConfigOptions, Dispatcher),
-        options = NewConfigOptions}});
+    NewConfigOptions = check_incoming(true, ConfigOptions),
+    hibernate_check({noreply,
+                     State#state{
+                         queue_requests = true,
+                         request_pid = handle_module_request_loop_pid(
+                             RequestPid,
+                             {'cloudi_service_request_loop',
+                              'send_async', Name, Pattern,
+                              RequestInfo, Request,
+                              Timeout, Priority, TransId, Source,
+                              Module, Dispatcher, NewConfigOptions,
+                              ServiceState}, NewConfigOptions, Dispatcher),
+                         options = NewConfigOptions}});
 
 handle_info({'cloudi_service_send_sync',
              Name, Pattern, RequestInfo, Request,
@@ -874,17 +1019,19 @@ handle_info({'cloudi_service_send_sync',
                    service_state = ServiceState,
                    request_pid = RequestPid,
                    options = ConfigOptions} = State) ->
-    NewConfigOptions = check_incoming(ConfigOptions),
-    hibernate_check({noreply, State#state{
-        queue_requests = true,
-        request_pid = handle_module_request_loop_pid(RequestPid,
-            {'cloudi_service_request_loop',
-             'send_sync', Name, Pattern,
-             RequestInfo, Request,
-             Timeout, Priority, TransId, Source,
-             Module, Dispatcher, NewConfigOptions,
-             ServiceState}, NewConfigOptions, Dispatcher),
-        options = NewConfigOptions}});
+    NewConfigOptions = check_incoming(true, ConfigOptions),
+    hibernate_check({noreply,
+                     State#state{
+                         queue_requests = true,
+                         request_pid = handle_module_request_loop_pid(
+                             RequestPid,
+                             {'cloudi_service_request_loop',
+                              'send_sync', Name, Pattern,
+                              RequestInfo, Request,
+                              Timeout, Priority, TransId, Source,
+                              Module, Dispatcher, NewConfigOptions,
+                              ServiceState}, NewConfigOptions, Dispatcher),
+                         options = NewConfigOptions}});
 
 handle_info({Type, _, _, _, _, 0, _, _, _},
             #state{queue_requests = true} = State)
@@ -936,6 +1083,8 @@ handle_info({'cloudi_service_return_async',
             #state{send_timeouts = SendTimeouts,
                    receiver_pid = ReceiverPid,
                    options = #config_service_options{
+                       request_timeout_immediate_max =
+                           RequestTimeoutImmediateMax,
                        response_timeout_adjustment =
                            ResponseTimeoutAdjustment}} = State) ->
     true = Source =:= ReceiverPid,
@@ -943,19 +1092,21 @@ handle_info({'cloudi_service_return_async',
         error ->
             % send_async timeout already occurred
             {noreply, State};
-        {ok, {active, Tref}}
+        {ok, {active, Pid, Tref}}
             when ResponseInfo == <<>>, Response == <<>> ->
             if
-                ResponseTimeoutAdjustment ->
+                ResponseTimeoutAdjustment;
+                OldTimeout > RequestTimeoutImmediateMax ->
                     erlang:cancel_timer(Tref);
                 true ->
                     ok
             end,
             ReceiverPid ! {'timeout_async_active', TransId},
-            {noreply, send_timeout_end(TransId, State)};
-        {ok, {active, Tref}} ->
+            {noreply, send_timeout_end(TransId, Pid, State)};
+        {ok, {active, Pid, Tref}} ->
             Timeout = if
-                ResponseTimeoutAdjustment ->
+                ResponseTimeoutAdjustment;
+                OldTimeout > RequestTimeoutImmediateMax ->
                     case erlang:cancel_timer(Tref) of
                         false ->
                             0;
@@ -967,19 +1118,21 @@ handle_info({'cloudi_service_return_async',
             end,
             ReceiverPid ! {'return_async_active', Name, Pattern,
                            ResponseInfo, Response, Timeout, TransId},
-            {noreply, send_timeout_end(TransId, State)};
-        {ok, {passive, Tref}}
+            {noreply, send_timeout_end(TransId, Pid, State)};
+        {ok, {passive, Pid, Tref}}
             when ResponseInfo == <<>>, Response == <<>> ->
             if
-                ResponseTimeoutAdjustment ->
+                ResponseTimeoutAdjustment;
+                OldTimeout > RequestTimeoutImmediateMax ->
                     erlang:cancel_timer(Tref);
                 true ->
                     ok
             end,
-            {noreply, send_timeout_end(TransId, State)};
-        {ok, {passive, Tref}} ->
+            {noreply, send_timeout_end(TransId, Pid, State)};
+        {ok, {passive, Pid, Tref}} ->
             Timeout = if
-                ResponseTimeoutAdjustment ->
+                ResponseTimeoutAdjustment;
+                OldTimeout > RequestTimeoutImmediateMax ->
                     case erlang:cancel_timer(Tref) of
                         false ->
                             0;
@@ -989,16 +1142,19 @@ handle_info({'cloudi_service_return_async',
                 true ->
                     OldTimeout
             end,
-            {noreply, send_timeout_end(TransId,
+            {noreply, send_timeout_end(TransId, Pid,
                 async_response_timeout_start(ResponseInfo, Response, Timeout,
                                              TransId, State))}
     end);
 
 handle_info({'cloudi_service_return_sync',
-             _, _, ResponseInfo, Response, _, TransId, Source},
+             _, _, ResponseInfo, Response,
+             OldTimeout, TransId, Source},
             #state{send_timeouts = SendTimeouts,
                    receiver_pid = ReceiverPid,
                    options = #config_service_options{
+                       request_timeout_immediate_max =
+                           RequestTimeoutImmediateMax,
                        response_timeout_adjustment =
                            ResponseTimeoutAdjustment}} = State) ->
     true = Source =:= ReceiverPid,
@@ -1006,9 +1162,10 @@ handle_info({'cloudi_service_return_sync',
         error ->
             % send_async timeout already occurred
             {noreply, State};
-        {ok, {Client, Tref}} ->
+        {ok, {Client, Pid, Tref}} ->
             if
-                ResponseTimeoutAdjustment ->
+                ResponseTimeoutAdjustment;
+                OldTimeout > RequestTimeoutImmediateMax ->
                     erlang:cancel_timer(Tref);
                 true ->
                     ok
@@ -1021,7 +1178,7 @@ handle_info({'cloudi_service_return_sync',
                 true ->
                     gen_server:reply(Client, {ok, ResponseInfo, Response})
             end,
-            {noreply, send_timeout_end(TransId, State)}
+            {noreply, send_timeout_end(TransId, Pid, State)}
     end);
 
 handle_info({'cloudi_service_send_async_timeout', TransId},
@@ -1042,11 +1199,11 @@ handle_info({'cloudi_service_send_async_timeout', TransId},
                     ok % cancel_timer avoided due to latency
             end,
             {noreply, State};
-        {ok, {active, _}} ->
+        {ok, {active, Pid, _}} ->
             ReceiverPid ! {'timeout_async_active', TransId},
-            {noreply, send_timeout_end(TransId, State)};
-        {ok, _} ->
-            {noreply, send_timeout_end(TransId, State)}
+            {noreply, send_timeout_end(TransId, Pid, State)};
+        {ok, {passive, Pid, _}} ->
+            {noreply, send_timeout_end(TransId, Pid, State)}
     end);
 
 handle_info({'cloudi_service_send_sync_timeout', TransId},
@@ -1066,9 +1223,9 @@ handle_info({'cloudi_service_send_sync_timeout', TransId},
                     ok % cancel_timer avoided due to latency
             end,
             {noreply, State};
-        {ok, {Client, _}} ->
+        {ok, {Client, Pid, _}} ->
             gen_server:reply(Client, {error, timeout}),
-            {noreply, send_timeout_end(TransId, State)}
+            {noreply, send_timeout_end(TransId, Pid, State)}
     end);
 
 handle_info({'cloudi_service_recv_async_timeout', TransId},
@@ -1077,6 +1234,92 @@ handle_info({'cloudi_service_recv_async_timeout', TransId},
                      State#state{
                          async_responses =
                              dict:erase(TransId, AsyncResponses)}});
+
+handle_info({'DOWN', _MonitorRef, process, Pid, _Info},
+            State) ->
+    hibernate_check({noreply, send_timeout_dead(Pid, State)});
+
+handle_info('cloudi_hibernate_rate',
+            #state{duo_mode_pid = undefined,
+                   request_pid = RequestPid,
+                   info_pid = InfoPid,
+                   options = #config_service_options{
+                       hibernate = Hibernate} = ConfigOptions} = State) ->
+    {Value, NewHibernate} = cloudi_rate_based_configuration:
+                            hibernate_reinit(Hibernate),
+    if
+        is_pid(RequestPid) ->
+            RequestPid ! {'cloudi_hibernate', Value};
+        true ->
+            ok
+    end,
+    if
+        is_pid(InfoPid) ->
+            InfoPid ! {'cloudi_hibernate', Value};
+        true ->
+            ok
+    end,
+    hibernate_check({noreply,
+                     State#state{
+                         options = ConfigOptions#config_service_options{
+                             hibernate = NewHibernate}}});
+
+handle_info({'cloudi_hibernate', Hibernate},
+            #state{duo_mode_pid = DuoModePid,
+                   options = ConfigOptions} = State) ->
+    true = is_pid(DuoModePid),
+    % force the hibernate state
+    hibernate_check({noreply,
+                     State#state{
+                         options = ConfigOptions#config_service_options{
+                             hibernate = Hibernate}}});
+
+handle_info('cloudi_count_process_dynamic_rate',
+            #state{dispatcher = Dispatcher,
+                   duo_mode_pid = undefined,
+                   options = #config_service_options{
+                       count_process_dynamic =
+                           CountProcessDynamic} = ConfigOptions} = State) ->
+    NewCountProcessDynamic = cloudi_rate_based_configuration:
+                             count_process_dynamic_reinit(Dispatcher,
+                                                          CountProcessDynamic),
+    hibernate_check({noreply,
+                     State#state{
+                         options = ConfigOptions#config_service_options{
+                             count_process_dynamic =
+                                 NewCountProcessDynamic}}});
+
+handle_info('cloudi_count_process_dynamic_terminate',
+            #state{receiver_pid = ReceiverPid,
+                   options = #config_service_options{
+                       count_process_dynamic = CountProcessDynamic,
+                       scope = Scope} = ConfigOptions} = State) ->
+    cloudi_x_cpg:leave(Scope, ReceiverPid, infinity),
+    NewCountProcessDynamic =
+        cloudi_rate_based_configuration:
+        count_process_dynamic_terminate_set(ReceiverPid, CountProcessDynamic),
+    hibernate_check({noreply,
+                     State#state{
+                         options = ConfigOptions#config_service_options{
+                             count_process_dynamic =
+                                 NewCountProcessDynamic}}});
+
+handle_info('cloudi_count_process_dynamic_terminate_check',
+            #state{dispatcher = Dispatcher,
+                   queue_requests = QueueRequests,
+                   duo_mode_pid = undefined} = State) ->
+    if
+        QueueRequests =:= false ->
+            {stop, {shutdown, cloudi_count_process_dynamic_terminate}, State};
+        QueueRequests =:= true ->
+            erlang:send_after(500, Dispatcher,
+                              'cloudi_count_process_dynamic_terminate_check'),
+            hibernate_check({noreply, State})
+    end;
+
+handle_info('cloudi_count_process_dynamic_terminate_now',
+            #state{duo_mode_pid = undefined} = State) ->
+    {stop, {shutdown, cloudi_count_process_dynamic_terminate}, State};
 
 handle_info(Request,
             #state{queue_requests = true,
@@ -1093,14 +1336,15 @@ handle_info(Request,
                    info_pid = InfoPid,
                    duo_mode_pid = undefined,
                    options = ConfigOptions} = State) ->
-    NewConfigOptions = check_incoming(ConfigOptions),
-    hibernate_check({noreply, State#state{
-        queue_requests = true,
-        info_pid = handle_module_info_loop_pid(InfoPid,
-            {'cloudi_service_info_loop',
-             Request, Module, Dispatcher, ServiceState},
-            NewConfigOptions, Dispatcher),
-        options = NewConfigOptions}});
+    NewConfigOptions = check_incoming(false, ConfigOptions),
+    hibernate_check({noreply,
+                     State#state{
+                         queue_requests = true,
+                         info_pid = handle_module_info_loop_pid(InfoPid,
+                             {'cloudi_service_info_loop',
+                              Request, Module, Dispatcher, ServiceState},
+                              NewConfigOptions, Dispatcher),
+                         options = NewConfigOptions}});
 
 handle_info(Request, #state{duo_mode_pid = DuoModePid} = State) ->
     true = is_pid(DuoModePid),
@@ -1204,7 +1448,8 @@ handle_send_async(Name, RequestInfo, Request,
                    Name, Pattern, RequestInfo, Request,
                    Timeout, Priority, TransId, ReceiverPid},
             gen_server:reply(Client, {ok, TransId}),
-            {noreply, send_async_timeout_start(Timeout, TransId, State)}
+            {noreply,
+             send_async_timeout_start(Timeout, TransId, Pid, State)}
     end.
 
 handle_send_async_pid(Name, Pattern, RequestInfo, Request,
@@ -1215,7 +1460,8 @@ handle_send_async_pid(Name, Pattern, RequestInfo, Request,
     Pid ! {'cloudi_service_send_async',
            Name, Pattern, RequestInfo, Request,
            Timeout, Priority, TransId, ReceiverPid},
-    {reply, {ok, TransId}, send_async_timeout_start(Timeout, TransId, State)}.
+    {reply, {ok, TransId},
+     send_async_timeout_start(Timeout, TransId, Pid, State)}.
 
 handle_send_async_active(Name, RequestInfo, Request,
                          Timeout, Priority, Client,
@@ -1246,7 +1492,8 @@ handle_send_async_active(Name, RequestInfo, Request,
                    Name, Pattern, RequestInfo, Request,
                    Timeout, Priority, TransId, ReceiverPid},
             gen_server:reply(Client, {ok, TransId}),
-            {noreply, send_async_active_timeout_start(Timeout, TransId, State)}
+            {noreply,
+             send_async_active_timeout_start(Timeout, TransId, Pid, State)}
     end.
 
 handle_send_async_active_pid(Name, Pattern, RequestInfo, Request,
@@ -1258,7 +1505,7 @@ handle_send_async_active_pid(Name, Pattern, RequestInfo, Request,
            Name, Pattern, RequestInfo, Request,
            Timeout, Priority, TransId, ReceiverPid},
     {reply, {ok, TransId},
-     send_async_active_timeout_start(Timeout, TransId, State)}.
+     send_async_active_timeout_start(Timeout, TransId, Pid, State)}.
 
 handle_send_sync(Name, RequestInfo, Request,
                  Timeout, Priority, Client,
@@ -1288,7 +1535,8 @@ handle_send_sync(Name, RequestInfo, Request,
             Pid ! {'cloudi_service_send_sync',
                    Name, Pattern, RequestInfo, Request,
                    Timeout, Priority, TransId, ReceiverPid},
-            {noreply, send_sync_timeout_start(Timeout, TransId, Client, State)}
+            {noreply,
+             send_sync_timeout_start(Timeout, TransId, Pid, Client, State)}
     end.
 
 handle_send_sync_pid(Name, Pattern, RequestInfo, Request,
@@ -1299,12 +1547,36 @@ handle_send_sync_pid(Name, Pattern, RequestInfo, Request,
     Pid ! {'cloudi_service_send_sync',
            Name, Pattern, RequestInfo, Request,
            Timeout, Priority, TransId, ReceiverPid},
-    {noreply, send_sync_timeout_start(Timeout, TransId, Client, State)}.
+    {noreply,
+     send_sync_timeout_start(Timeout, TransId, Pid, Client, State)}.
+
+handle_mcast_async_pids(_Name, _Pattern, _RequestInfo, _Request,
+                        _Timeout, _Priority,
+                        TransIdList, [], Client,
+                        State) ->
+    gen_server:reply(Client, {ok, lists:reverse(TransIdList)}),
+    State;
+
+handle_mcast_async_pids(Name, Pattern, RequestInfo, Request,
+                        Timeout, Priority,
+                        TransIdList, [Pid | PidList], Client,
+                        #state{receiver_pid = ReceiverPid,
+                               uuid_generator = UUID} = State) ->
+    TransId = cloudi_x_uuid:get_v1(UUID),
+    Pid ! {'cloudi_service_send_async',
+           Name, Pattern, RequestInfo, Request,
+           Timeout, Priority, TransId, ReceiverPid},
+    handle_mcast_async_pids(Name, Pattern, RequestInfo, Request,
+                            Timeout, Priority,
+                            [TransId | TransIdList], PidList, Client,
+                            send_async_timeout_start(Timeout,
+                                                     TransId,
+                                                     Pid,
+                                                     State)).
 
 handle_mcast_async(Name, RequestInfo, Request,
                    Timeout, Priority, Client,
                    #state{receiver_pid = ReceiverPid,
-                          uuid_generator = UUID,
                           dest_refresh = DestRefresh,
                           cpg_data = Groups,
                           options = #config_service_options{
@@ -1325,24 +1597,39 @@ handle_mcast_async(Name, RequestInfo, Request,
             gen_server:reply(Client, {error, timeout}),
             {noreply, State};
         {ok, Pattern, PidList} ->
-            TransIdList = lists:map(fun(Pid) ->
-                TransId = cloudi_x_uuid:get_v1(UUID),
-                Pid ! {'cloudi_service_send_async',
-                       Name, Pattern, RequestInfo, Request,
-                       Timeout, Priority, TransId, ReceiverPid},
-                TransId
-            end, PidList),
-            gen_server:reply(Client, {ok, TransIdList}),
-            NewState = lists:foldl(fun(Id, S) ->
-                send_async_timeout_start(Timeout, Id, S)
-            end, State, TransIdList),
-            {noreply, NewState}
+            {noreply,
+             handle_mcast_async_pids(Name, Pattern, RequestInfo, Request,
+                                     Timeout, Priority,
+                                     [], PidList, Client, State)}
     end.
+
+handle_mcast_async_pids_active(_Name, _Pattern, _RequestInfo, _Request,
+                               _Timeout, _Priority,
+                               TransIdList, [], Client,
+                               State) ->
+    gen_server:reply(Client, {ok, lists:reverse(TransIdList)}),
+    State;
+
+handle_mcast_async_pids_active(Name, Pattern, RequestInfo, Request,
+                               Timeout, Priority,
+                               TransIdList, [Pid | PidList], Client,
+                               #state{receiver_pid = ReceiverPid,
+                                      uuid_generator = UUID} = State) ->
+    TransId = cloudi_x_uuid:get_v1(UUID),
+    Pid ! {'cloudi_service_send_async',
+           Name, Pattern, RequestInfo, Request,
+           Timeout, Priority, TransId, ReceiverPid},
+    handle_mcast_async_pids_active(Name, Pattern, RequestInfo, Request,
+                                   Timeout, Priority,
+                                   [TransId | TransIdList], PidList, Client,
+                                   send_async_active_timeout_start(Timeout,
+                                                                   TransId,
+                                                                   Pid,
+                                                                   State)).
 
 handle_mcast_async_active(Name, RequestInfo, Request,
                           Timeout, Priority, Client,
                           #state{receiver_pid = ReceiverPid,
-                                 uuid_generator = UUID,
                                  dest_refresh = DestRefresh,
                                  cpg_data = Groups,
                                  options = #config_service_options{
@@ -1363,18 +1650,10 @@ handle_mcast_async_active(Name, RequestInfo, Request,
             gen_server:reply(Client, {error, timeout}),
             {noreply, State};
         {ok, Pattern, PidList} ->
-            TransIdList = lists:map(fun(Pid) ->
-                TransId = cloudi_x_uuid:get_v1(UUID),
-                Pid ! {'cloudi_service_send_async',
-                       Name, Pattern, RequestInfo, Request,
-                       Timeout, Priority, TransId, ReceiverPid},
-                TransId
-            end, PidList),
-            gen_server:reply(Client, {ok, TransIdList}),
-            NewState = lists:foldl(fun(Id, S) ->
-                send_async_active_timeout_start(Timeout, Id, S)
-            end, State, TransIdList),
-            {noreply, NewState}
+            {noreply,
+             handle_mcast_async_pids_active(Name, Pattern, RequestInfo, Request,
+                                            Timeout, Priority,
+                                            [], PidList, Client, State)}
     end.
 
 handle_module_request('send_async', Name, Pattern, RequestInfo, Request,
@@ -1382,7 +1661,9 @@ handle_module_request('send_async', Name, Pattern, RequestInfo, Request,
                       Module, Dispatcher,
                       #config_service_options{
                           request_timeout_adjustment =
-                              RequestTimeoutAdjustment}, ServiceState) ->
+                              RequestTimeoutAdjustment,
+                          response_timeout_immediate_max =
+                              ResponseTimeoutImmediateMax}, ServiceState) ->
     RequestTimeoutF = if
         RequestTimeoutAdjustment ->
             RequestTimeStart = os:timestamp(),
@@ -1403,13 +1684,33 @@ handle_module_request('send_async', Name, Pattern, RequestInfo, Request,
                                              ServiceState,
                                              Dispatcher) of
         {reply, <<>>, NewServiceState} ->
-            {'cloudi_service_request_success', undefined, NewServiceState};
+            if
+                Timeout =< ResponseTimeoutImmediateMax ->
+                    {'cloudi_service_request_success',
+                     undefined, NewServiceState};
+                true ->
+                    {'cloudi_service_request_success',
+                     {'cloudi_service_return_async', Name, Pattern,
+                      <<>>, <<>>, Timeout, TransId, Source},
+                     NewServiceState}
+            end;
         {reply, Response, NewServiceState} ->
             {'cloudi_service_request_success',
              {'cloudi_service_return_async', Name, Pattern,
               <<>>, Response,
               RequestTimeoutF(Timeout), TransId, Source},
              NewServiceState};
+        {reply, <<>>, <<>>, NewServiceState} ->
+            if
+                Timeout =< ResponseTimeoutImmediateMax ->
+                    {'cloudi_service_request_success',
+                     undefined, NewServiceState};
+                true ->
+                    {'cloudi_service_request_success',
+                     {'cloudi_service_return_async', Name, Pattern,
+                      <<>>, <<>>, Timeout, TransId, Source},
+                     NewServiceState}
+            end;
         {reply, ResponseInfo, Response, NewServiceState} ->
             {'cloudi_service_request_success',
              {'cloudi_service_return_async', Name, Pattern,
@@ -1450,13 +1751,33 @@ handle_module_request('send_async', Name, Pattern, RequestInfo, Request,
              stop, Reason, undefined, NewServiceState}
     catch
         throw:{cloudi_service_return, {<<>>}} ->
-            {'cloudi_service_request_success', undefined, ServiceState};
+            if
+                Timeout =< ResponseTimeoutImmediateMax ->
+                    {'cloudi_service_request_success',
+                     undefined, ServiceState};
+                true ->
+                    {'cloudi_service_request_success',
+                     {'cloudi_service_return_async', Name, Pattern,
+                      <<>>, <<>>, Timeout, TransId, Source},
+                     ServiceState}
+            end;
         throw:{cloudi_service_return, {Response}} ->
             {'cloudi_service_request_success',
              {'cloudi_service_return_async', Name, Pattern,
               <<>>, Response,
               RequestTimeoutF(Timeout), TransId, Source},
              ServiceState};
+        throw:{cloudi_service_return, {<<>>, <<>>}} ->
+            if
+                Timeout =< ResponseTimeoutImmediateMax ->
+                    {'cloudi_service_request_success',
+                     undefined, ServiceState};
+                true ->
+                    {'cloudi_service_request_success',
+                     {'cloudi_service_return_async', Name, Pattern,
+                      <<>>, <<>>, Timeout, TransId, Source},
+                     ServiceState}
+            end;
         throw:{cloudi_service_return, {ResponseInfo, Response}} ->
             {'cloudi_service_request_success',
              {'cloudi_service_return_async', Name, Pattern,
@@ -1468,21 +1789,49 @@ handle_module_request('send_async', Name, Pattern, RequestInfo, Request,
                 ResponseInfo, Response,
                 Timeout, TransId, Source}}
             when ReturnType =:= 'cloudi_service_return_async' ->
-            {'cloudi_service_request_success',
-             {ReturnType, Name, Pattern,
-              ResponseInfo, Response,
-              RequestTimeoutF(Timeout), TransId, Source},
-             ServiceState};
+            if
+                ResponseInfo == <<>>, Response == <<>> ->
+                    if
+                        Timeout =< ResponseTimeoutImmediateMax ->
+                            {'cloudi_service_request_success',
+                             undefined, ServiceState};
+                        true ->
+                            {'cloudi_service_request_success',
+                             {ReturnType, Name, Pattern,
+                              <<>>, <<>>, Timeout, TransId, Source},
+                             ServiceState}
+                    end;
+                true ->
+                    {'cloudi_service_request_success',
+                     {ReturnType, Name, Pattern,
+                      ResponseInfo, Response,
+                      RequestTimeoutF(Timeout), TransId, Source},
+                     ServiceState}
+            end;
         throw:{cloudi_service_return,
                {ReturnType, Name, Pattern,
                 ResponseInfo, Response,
                 NextTimeout, TransId, Source}}
             when ReturnType =:= 'cloudi_service_return_async' ->
-            {'cloudi_service_request_success',
-             {ReturnType, Name, Pattern,
-              ResponseInfo, Response,
-              NextTimeout, TransId, Source},
-             ServiceState};
+            if
+                ResponseInfo == <<>>, Response == <<>> ->
+                    if
+                        NextTimeout =< ResponseTimeoutImmediateMax ->
+                            {'cloudi_service_request_success',
+                             undefined, ServiceState};
+                        true ->
+                            {'cloudi_service_request_success',
+                             {ReturnType, Name, Pattern,
+                              <<>>, <<>>, NextTimeout, TransId, Source},
+                             ServiceState}
+                    end;
+                true ->
+                    {'cloudi_service_request_success',
+                     {ReturnType, Name, Pattern,
+                      ResponseInfo, Response,
+                      NextTimeout, TransId, Source},
+                     ServiceState}
+            end;
         throw:{cloudi_service_forward,
                {ForwardType, NextName,
                 NextRequestInfo, NextRequest,
@@ -1513,7 +1862,9 @@ handle_module_request('send_sync', Name, Pattern, RequestInfo, Request,
                       Module, Dispatcher,
                       #config_service_options{
                           request_timeout_adjustment =
-                              RequestTimeoutAdjustment}, ServiceState) ->
+                              RequestTimeoutAdjustment,
+                          response_timeout_immediate_max =
+                              ResponseTimeoutImmediateMax}, ServiceState) ->
     RequestTimeoutF = if
         RequestTimeoutAdjustment ->
             RequestTimeStart = os:timestamp(),
@@ -1534,13 +1885,33 @@ handle_module_request('send_sync', Name, Pattern, RequestInfo, Request,
                                              ServiceState,
                                              Dispatcher) of
         {reply, <<>>, NewServiceState} ->
-            {'cloudi_service_request_success', undefined, NewServiceState};
+            if
+                Timeout =< ResponseTimeoutImmediateMax ->
+                    {'cloudi_service_request_success',
+                     undefined, NewServiceState};
+                true ->
+                    {'cloudi_service_request_success',
+                     {'cloudi_service_return_sync', Name, Pattern,
+                      <<>>, <<>>, Timeout, TransId, Source},
+                     NewServiceState}
+            end;
         {reply, Response, NewServiceState} ->
             {'cloudi_service_request_success',
              {'cloudi_service_return_sync', Name, Pattern,
               <<>>, Response,
               RequestTimeoutF(Timeout), TransId, Source},
              NewServiceState};
+        {reply, <<>>, <<>>, NewServiceState} ->
+            if
+                Timeout =< ResponseTimeoutImmediateMax ->
+                    {'cloudi_service_request_success',
+                     undefined, NewServiceState};
+                true ->
+                    {'cloudi_service_request_success',
+                     {'cloudi_service_return_sync', Name, Pattern,
+                      <<>>, <<>>, Timeout, TransId, Source},
+                     NewServiceState}
+            end;
         {reply, ResponseInfo, Response, NewServiceState} ->
             {'cloudi_service_request_success',
              {'cloudi_service_return_sync', Name, Pattern,
@@ -1581,13 +1952,33 @@ handle_module_request('send_sync', Name, Pattern, RequestInfo, Request,
              stop, Reason, undefined, NewServiceState}
     catch
         throw:{cloudi_service_return, {<<>>}} ->
-            {'cloudi_service_request_success', undefined, ServiceState};
+            if
+                Timeout =< ResponseTimeoutImmediateMax ->
+                    {'cloudi_service_request_success',
+                     undefined, ServiceState};
+                true ->
+                    {'cloudi_service_request_success',
+                     {'cloudi_service_return_sync', Name, Pattern,
+                      <<>>, <<>>, Timeout, TransId, Source},
+                     ServiceState}
+            end;
         throw:{cloudi_service_return, {Response}} ->
             {'cloudi_service_request_success',
              {'cloudi_service_return_sync', Name, Pattern,
               <<>>, Response,
               RequestTimeoutF(Timeout), TransId, Source},
              ServiceState};
+        throw:{cloudi_service_return, {<<>>, <<>>}} ->
+            if
+                Timeout =< ResponseTimeoutImmediateMax ->
+                    {'cloudi_service_request_success',
+                     undefined, ServiceState};
+                true ->
+                    {'cloudi_service_request_success',
+                     {'cloudi_service_return_sync', Name, Pattern,
+                      <<>>, <<>>, Timeout, TransId, Source},
+                     ServiceState}
+            end;
         throw:{cloudi_service_return, {ResponseInfo, Response}} ->
             {'cloudi_service_request_success',
              {'cloudi_service_return_sync', Name, Pattern,
@@ -1599,21 +1990,49 @@ handle_module_request('send_sync', Name, Pattern, RequestInfo, Request,
                 ResponseInfo, Response,
                 Timeout, TransId, Source}}
             when ReturnType =:= 'cloudi_service_return_sync' ->
-            {'cloudi_service_request_success',
-             {ReturnType, Name, Pattern,
-              ResponseInfo, Response,
-              RequestTimeoutF(Timeout), TransId, Source},
-             ServiceState};
+            if
+                ResponseInfo == <<>>, Response == <<>> ->
+                    if
+                        Timeout =< ResponseTimeoutImmediateMax ->
+                            {'cloudi_service_request_success',
+                             undefined, ServiceState};
+                        true ->
+                            {'cloudi_service_request_success',
+                             {ReturnType, Name, Pattern,
+                              <<>>, <<>>, Timeout, TransId, Source},
+                             ServiceState}
+                    end;
+                true ->
+                    {'cloudi_service_request_success',
+                     {ReturnType, Name, Pattern,
+                      ResponseInfo, Response,
+                      RequestTimeoutF(Timeout), TransId, Source},
+                     ServiceState}
+            end;
         throw:{cloudi_service_return,
                {ReturnType, Name, Pattern,
                 ResponseInfo, Response,
                 NextTimeout, TransId, Source}}
             when ReturnType =:= 'cloudi_service_return_sync' ->
-            {'cloudi_service_request_success',
-             {ReturnType, Name, Pattern,
-              ResponseInfo, Response,
-              NextTimeout, TransId, Source},
-             ServiceState};
+            if
+                ResponseInfo == <<>>, Response == <<>> ->
+                    if
+                        NextTimeout =< ResponseTimeoutImmediateMax ->
+                            {'cloudi_service_request_success',
+                             undefined, ServiceState};
+                        true ->
+                            {'cloudi_service_request_success',
+                             {ReturnType, Name, Pattern,
+                              <<>>, <<>>, NextTimeout, TransId, Source},
+                             ServiceState}
+                    end;
+                true ->
+                    {'cloudi_service_request_success',
+                     {ReturnType, Name, Pattern,
+                      ResponseInfo, Response,
+                      NextTimeout, TransId, Source},
+                     ServiceState}
+            end;
         throw:{cloudi_service_forward,
                {ForwardType, NextName,
                 NextRequestInfo, NextRequest,
@@ -1640,25 +2059,114 @@ handle_module_request('send_sync', Name, Pattern, RequestInfo, Request,
     end.
 
 handle_module_info(Request, Module, Dispatcher, ServiceState) ->
-    case Module:cloudi_service_handle_info(Request,
-                                           ServiceState,
-                                           Dispatcher) of
+    try Module:cloudi_service_handle_info(Request,
+                                          ServiceState,
+                                          Dispatcher) of
         {noreply, NewServiceState} ->
             {'cloudi_service_info_success',
              NewServiceState};
         {stop, Reason, NewServiceState} ->
             {'cloudi_service_info_failure',
-             Reason, NewServiceState}
+             stop, Reason, undefined, NewServiceState}
+    catch
+        Type:Error ->
+            {'cloudi_service_info_failure',
+             Type, Error, erlang:get_stacktrace(), ServiceState}
     end.
 
-send_async_active_timeout_start(Timeout, TransId,
-                                #state{send_timeouts = SendTimeouts} = State)
+send_async_active_timeout_start(Timeout, TransId, Pid,
+                                #state{dispatcher = Dispatcher,
+                                       send_timeouts = SendTimeouts,
+                                       send_timeout_monitors =
+                                           SendTimeoutMonitors,
+                                       options = #config_service_options{
+                                           request_timeout_immediate_max =
+                                               RequestTimeoutImmediateMax}} =
+                                    State)
+    when is_integer(Timeout), is_binary(TransId), is_pid(Pid),
+         Timeout > RequestTimeoutImmediateMax ->
+    NewSendTimeoutMonitors = case dict:find(Pid, SendTimeoutMonitors) of
+        {ok, {MonitorRef, TransIdList}} ->
+            dict:store(Pid,
+                       {MonitorRef,
+                        lists:umerge(TransIdList, [TransId])},
+                       SendTimeoutMonitors);
+        error ->
+            MonitorRef = erlang:monitor(process, Pid),
+            dict:store(Pid, {MonitorRef, [TransId]}, SendTimeoutMonitors)
+    end,
+    State#state{
+        send_timeouts = dict:store(TransId,
+            {active, Pid,
+             erlang:send_after(Timeout, Dispatcher,
+                               {'cloudi_service_send_async_timeout', TransId})},
+            SendTimeouts),
+        send_timeout_monitors = NewSendTimeoutMonitors};
+
+send_async_active_timeout_start(Timeout, TransId, _Pid,
+                                #state{dispatcher = Dispatcher,
+                                       send_timeouts = SendTimeouts} = State)
     when is_integer(Timeout), is_binary(TransId) ->
     State#state{
-        send_timeouts = dict:store(TransId, {active,
-            erlang:send_after(Timeout, self(),
-                              {'cloudi_service_send_async_timeout', TransId})},
+        send_timeouts = dict:store(TransId,
+            {active, undefined,
+             erlang:send_after(Timeout, Dispatcher,
+                               {'cloudi_service_send_async_timeout', TransId})},
             SendTimeouts)}.
+
+recv_timeout_start(Timeout, Priority, TransId, T,
+                   #state{recv_timeouts = RecvTimeouts,
+                          queued = Queue,
+                          receiver_pid = ReceiverPid} = State)
+    when is_integer(Timeout), is_integer(Priority), is_binary(TransId) ->
+    State#state{
+        recv_timeouts = dict:store(TransId,
+            erlang:send_after(Timeout, ReceiverPid,
+                {'cloudi_service_recv_timeout', Priority, TransId}),
+            RecvTimeouts),
+        queued = cloudi_x_pqueue4:in(T, Priority, Queue)}.
+
+duo_recv_timeout_start(Timeout, Priority, TransId, T,
+                       #state_duo{duo_mode_pid = DuoModePid,
+                                  recv_timeouts = RecvTimeouts,
+                                  queued = Queue} = State)
+    when is_integer(Timeout), is_integer(Priority), is_binary(TransId) ->
+    State#state_duo{
+        recv_timeouts = dict:store(TransId,
+            erlang:send_after(Timeout, DuoModePid,
+                {'cloudi_service_recv_timeout', Priority, TransId}),
+            RecvTimeouts),
+        queued = cloudi_x_pqueue4:in(T, Priority, Queue)}.
+
+recv_asyncs_pick(Results, Consume, AsyncResponses) ->
+    recv_asyncs_pick(Results, [], true, false, Consume, AsyncResponses).
+
+recv_asyncs_pick([], L, Done, FoundOne, _Consume, NewAsyncResponses) ->
+    {Done, not FoundOne, lists:reverse(L), NewAsyncResponses};
+
+recv_asyncs_pick([{<<>>, <<>>, TransId} = Entry | Results], L,
+                 Done, FoundOne, Consume, AsyncResponses) ->
+    case dict:find(TransId, AsyncResponses) of
+        error ->
+            recv_asyncs_pick(Results,
+                             [Entry | L],
+                             false, FoundOne, Consume, AsyncResponses);
+        {ok, {ResponseInfo, Response}} ->
+            NewAsyncResponses = if
+                Consume =:= true ->
+                    dict:erase(TransId, AsyncResponses);
+                Consume =:= false ->
+                    AsyncResponses
+            end,
+            recv_asyncs_pick(Results,
+                             [{ResponseInfo, Response, TransId} | L],
+                             Done, true, Consume, NewAsyncResponses)
+    end;
+
+recv_asyncs_pick([{_, _, _} = Entry | Results], L,
+                 Done, _FoundOne, Consume, AsyncResponses) ->
+    recv_asyncs_pick(Results, [Entry | L],
+                     Done, true, Consume, AsyncResponses).
 
 process_queue(NewServiceState,
               #state{dispatcher = Dispatcher,
@@ -1683,7 +2191,7 @@ process_queue(NewServiceState,
                 V ->
                     V
             end,
-            NewConfigOptions = check_incoming(ConfigOptions),
+            NewConfigOptions = check_incoming(true, ConfigOptions),
             State#state{
                 recv_timeouts = dict:erase(TransId, RecvTimeouts),
                 queued = NewQueue,
@@ -1705,7 +2213,7 @@ process_queue(NewServiceState,
                 V ->
                     V
             end,
-            NewConfigOptions = check_incoming(ConfigOptions),
+            NewConfigOptions = check_incoming(true, ConfigOptions),
             State#state{
                 recv_timeouts = dict:erase(TransId, RecvTimeouts),
                 queued = NewQueue,
@@ -1732,7 +2240,7 @@ process_queue_info(NewServiceState,
                         queued_info = NewQueueInfo,
                         service_state = NewServiceState};
         {{value, Request}, NewQueueInfo} ->
-            NewConfigOptions = check_incoming(ConfigOptions),
+            NewConfigOptions = check_incoming(false, ConfigOptions),
             State#state{
                 queued_info = NewQueueInfo,
                 info_pid = handle_module_info_loop_pid(InfoPid,
@@ -1754,24 +2262,51 @@ process_queues(NewServiceState, State) ->
     end.
 
 -compile({inline, [{hibernate_check, 1}]}).
+
 hibernate_check({reply, _,
                  #state{options = #config_service_options{
                             hibernate = false}}} = Result) ->
     Result;
+
 hibernate_check({noreply,
                  #state{options = #config_service_options{
                             hibernate = false}}} = Result) ->
     Result;
+
 hibernate_check({stop, _, _} = Result) ->
     Result;
+
 hibernate_check({reply, Reply,
                  #state{options = #config_service_options{
                             hibernate = true}} = State}) ->
     {reply, Reply, State, hibernate};
+
 hibernate_check({noreply,
                  #state{options = #config_service_options{
                             hibernate = true}} = State}) ->
-    {noreply, State, hibernate}.
+    {noreply, State, hibernate};
+
+hibernate_check({reply, Reply,
+                 #state{options = #config_service_options{
+                            hibernate = Hibernate}} = State})
+    when is_tuple(Hibernate) ->
+    case cloudi_rate_based_configuration:hibernate_check(Hibernate) of
+        false ->
+            {reply, Reply, State};
+        true ->
+            {reply, Reply, State, hibernate}
+    end;
+
+hibernate_check({noreply,
+                 #state{options = #config_service_options{
+                            hibernate = Hibernate}} = State})
+    when is_tuple(Hibernate) ->
+    case cloudi_rate_based_configuration:hibernate_check(Hibernate) of
+        false ->
+            {noreply, State};
+        true ->
+            {noreply, State, hibernate}
+    end.
 
 handle_module_request_loop_pid(OldRequestPid, ModuleRequest,
                                #config_service_options{
@@ -1783,14 +2318,14 @@ handle_module_request_loop_pid(OldRequestPid, ModuleRequest,
                                        Hibernate}, ResultPid) ->
     if
         OldRequestPid =:= undefined ->
-            if
-                Hibernate =:= false ->
+            case cloudi_rate_based_configuration:hibernate_check(Hibernate) of
+                false ->
                     erlang:spawn_opt(fun() ->
                         handle_module_request_loop_normal(RequestPidUses,
                                                           ModuleRequest,
                                                           ResultPid)
                     end, RequestPidOptions);
-                Hibernate =:= true ->
+                true ->
                     erlang:spawn_opt(fun() ->
                         handle_module_request_loop_hibernate(RequestPidUses,
                                                              ModuleRequest,
@@ -1804,6 +2339,11 @@ handle_module_request_loop_pid(OldRequestPid, ModuleRequest,
 
 handle_module_request_loop_normal(Uses, ResultPid) ->
     receive
+        {'cloudi_hibernate', false} ->
+            handle_module_request_loop_normal(Uses, ResultPid);
+        {'cloudi_hibernate', true} ->
+            erlang:hibernate(?MODULE, handle_module_request_loop_hibernate,
+                             [Uses, ResultPid]);
         {'cloudi_service_request_loop',
          _Type, _Name, _Pattern,
          _RequestInfo, _Request,
@@ -1817,6 +2357,11 @@ handle_module_request_loop_normal(Uses, ResultPid) ->
 
 handle_module_request_loop_hibernate(Uses, ResultPid) ->
     receive
+        {'cloudi_hibernate', false} ->
+            handle_module_request_loop_normal(Uses, ResultPid);
+        {'cloudi_hibernate', true} ->
+            erlang:hibernate(?MODULE, handle_module_request_loop_hibernate,
+                             [Uses, ResultPid]);
         {'cloudi_service_request_loop',
          _Type, _Name, _Pattern,
          _RequestInfo, _Request,
@@ -1888,14 +2433,14 @@ handle_module_info_loop_pid(OldInfoPid, ModuleInfo,
                                     Hibernate}, ResultPid) ->
     if
         OldInfoPid =:= undefined ->
-            if
-                Hibernate =:= false ->
+            case cloudi_rate_based_configuration:hibernate_check(Hibernate) of
+                false ->
                     erlang:spawn_opt(fun() ->
                         handle_module_info_loop_normal(InfoPidUses,
                                                        ModuleInfo,
                                                        ResultPid)
                     end, InfoPidOptions);
-                Hibernate =:= true ->
+                true ->
                     erlang:spawn_opt(fun() ->
                         handle_module_info_loop_hibernate(InfoPidUses,
                                                           ModuleInfo,
@@ -1909,6 +2454,11 @@ handle_module_info_loop_pid(OldInfoPid, ModuleInfo,
 
 handle_module_info_loop_normal(Uses, ResultPid) ->
     receive
+        {'cloudi_hibernate', false} ->
+            handle_module_info_loop_normal(Uses, ResultPid);
+        {'cloudi_hibernate', true} ->
+            erlang:hibernate(?MODULE, handle_module_info_loop_hibernate,
+                             [Uses, ResultPid]);
         {'cloudi_service_info_loop',
          _Request, _Module, _Dispatcher,
          _NewServiceState} = ModuleInfo ->
@@ -1919,6 +2469,11 @@ handle_module_info_loop_normal(Uses, ResultPid) ->
 
 handle_module_info_loop_hibernate(Uses, ResultPid) ->
     receive
+        {'cloudi_hibernate', false} ->
+            handle_module_info_loop_normal(Uses, ResultPid);
+        {'cloudi_hibernate', true} ->
+            erlang:hibernate(?MODULE, handle_module_info_loop_hibernate,
+                             [Uses, ResultPid]);
         {'cloudi_service_info_loop',
          _Request, _Module, _Dispatcher,
          _NewServiceState} = ModuleInfo ->
@@ -1968,9 +2523,7 @@ handle_module_info_loop_hibernate(Uses,
 % duo_mode specific logic
 
 duo_mode_loop_init(#state_duo{module = Module,
-                              dispatcher = Dispatcher,
-                              options = #config_service_options{
-                                  hibernate = Hibernate}} = State) ->
+                              dispatcher = Dispatcher} = State) ->
     receive
         {'cloudi_service_init_execute', Args, Timeout,
          DispatcherProcessDictionary,
@@ -1978,21 +2531,45 @@ duo_mode_loop_init(#state_duo{module = Module,
             {ok, DispatcherProxy} = cloudi_services_internal_init:start_link(
                 Timeout, DispatcherProcessDictionary, DispatcherState),
             Result = Module:cloudi_service_init(Args, Prefix, DispatcherProxy),
-            {NewDispatcherProcessDictionary, NewDispatcherState} =
+            {NewDispatcherProcessDictionary,
+             #state{recv_timeouts = RecvTimeouts,
+                    queue_requests = QueueRequests,
+                    queued = Queued,
+                    queued_info = QueuedInfo,
+                    options = ConfigOptions} = NewDispatcherState} =
                 cloudi_services_internal_init:stop_link(DispatcherProxy),
             case Result of
                 {ok, ServiceState} ->
+                    NewConfigOptions = check_init_receive(ConfigOptions),
                     erlang:process_flag(trap_exit, true),
+                    % duo_mode_pid takes control of any state that may
+                    % have been updated during initialization that is now
+                    % only relevant to the duo_mode pid
+                    NewState = State#state_duo{
+                        recv_timeouts = RecvTimeouts,
+                        queue_requests = QueueRequests,
+                        queued = Queued,
+                        queued_info = QueuedInfo,
+                        options = NewConfigOptions},
                     Dispatcher ! {'cloudi_service_init_state',
                                   NewDispatcherProcessDictionary,
-                                  NewDispatcherState},
-                    if
-                        Hibernate =:= true ->
-                            proc_lib:hibernate(?MODULE, duo_mode_loop,
-                                [duo_process_queues(ServiceState, State)]);
-                        Hibernate =:= false ->
+                                  NewDispatcherState#state{
+                                      recv_timeouts = undefined,
+                                      queue_requests = undefined,
+                                      queued = undefined,
+                                      queued_info = undefined,
+                                      options = NewConfigOptions}},
+                    #config_service_options{
+                        hibernate = Hibernate} = NewConfigOptions,
+                    case cloudi_rate_based_configuration:
+                         hibernate_check(Hibernate) of
+                        false ->
                             duo_mode_loop(duo_process_queues(ServiceState,
-                                                             State))
+                                                             NewState));
+                        true ->
+                            proc_lib:hibernate(?MODULE, duo_mode_loop,
+                                [duo_process_queues(ServiceState,
+                                                    NewState)])
                     end;
                 {stop, Reason, ServiceState} ->
                     Module:cloudi_service_terminate(Reason, ServiceState),
@@ -2003,24 +2580,24 @@ duo_mode_loop_init(#state_duo{module = Module,
             end
     end.
 
-duo_mode_loop(#state_duo{dispatcher = Dispatcher,
-                         options = #config_service_options{
-                             hibernate = Hibernate}} = State) ->
+duo_mode_loop(#state_duo{dispatcher = Dispatcher} = State) ->
     receive
         Request ->
-            % mimic a gen_server handle_info for code reuse
+            % mimic a gen_server:handle_info/2 for code reuse
             case duo_handle_info(Request, State) of
                 {stop, Reason, #state_duo{module = Module,
                                           service_state = ServiceState}} ->
                     Module:cloudi_service_terminate(Reason, ServiceState),
                     erlang:exit(Dispatcher, Reason);
-                {noreply, NewState} ->
-                    if
-                        Hibernate =:= true ->
+                {noreply, #state_duo{options = #config_service_options{
+                                         hibernate = Hibernate}} = NewState} ->
+                    case cloudi_rate_based_configuration:
+                         hibernate_check(Hibernate) of
+                        false ->
+                            duo_mode_loop(NewState);
+                        true ->
                             proc_lib:hibernate(?MODULE, duo_mode_loop,
-                                               [NewState]);
-                        Hibernate =:= false ->
-                            duo_mode_loop(NewState)
+                                               [NewState])
                     end
             end
     end.
@@ -2115,7 +2692,7 @@ duo_handle_info({'cloudi_service_send_async',
                            dispatcher = Dispatcher,
                            request_pid = RequestPid,
                            options = ConfigOptions} = State) ->
-    NewConfigOptions = check_incoming(ConfigOptions),
+    NewConfigOptions = check_incoming(true, ConfigOptions),
     {noreply, State#state_duo{
         queue_requests = true,
         request_pid = handle_module_request_loop_pid(RequestPid,
@@ -2137,7 +2714,7 @@ duo_handle_info({'cloudi_service_send_sync',
                            dispatcher = Dispatcher,
                            request_pid = RequestPid,
                            options = ConfigOptions} = State) ->
-    NewConfigOptions = check_incoming(ConfigOptions),
+    NewConfigOptions = check_incoming(true, ConfigOptions),
     {noreply, State#state_duo{
         queue_requests = true,
         request_pid = handle_module_request_loop_pid(RequestPid,
@@ -2192,6 +2769,55 @@ duo_handle_info({'cloudi_service_recv_timeout', Priority, TransId},
     {noreply, State#state_duo{recv_timeouts = dict:erase(TransId, RecvTimeouts),
                               queued = NewQueue}};
 
+duo_handle_info('cloudi_hibernate_rate',
+                #state_duo{dispatcher = Dispatcher,
+                           request_pid = RequestPid,
+                           options = #config_service_options{
+                               hibernate = Hibernate} = ConfigOptions
+                           } = State) ->
+    {Value, NewHibernate} = cloudi_rate_based_configuration:
+                            hibernate_reinit(Hibernate),
+    Dispatcher ! {'cloudi_hibernate', Value},
+    if
+        is_pid(RequestPid) ->
+            RequestPid ! {'cloudi_hibernate', Value};
+        true ->
+            ok
+    end,
+    {noreply,
+     State#state_duo{options = ConfigOptions#config_service_options{
+                         hibernate = NewHibernate}}};
+
+duo_handle_info('cloudi_count_process_dynamic_rate',
+                #state_duo{dispatcher = Dispatcher,
+                           options = #config_service_options{
+                               count_process_dynamic =
+                                   CountProcessDynamic} = ConfigOptions
+                           } = State) ->
+    NewCountProcessDynamic = cloudi_rate_based_configuration:
+                             count_process_dynamic_reinit(Dispatcher,
+                                                          CountProcessDynamic),
+    {noreply,
+     State#state_duo{options = ConfigOptions#config_service_options{
+                         count_process_dynamic = NewCountProcessDynamic}}};
+
+duo_handle_info('cloudi_count_process_dynamic_terminate_check',
+                #state_duo{duo_mode_pid = DuoModePid,
+                           queue_requests = QueueRequests} = State) ->
+    % count_process_dynamic does not have terminate set within the duo_mode_pid
+    % (not yet necessary)
+    if
+        QueueRequests =:= false ->
+            {stop, {shutdown, cloudi_count_process_dynamic_terminate}, State};
+        QueueRequests =:= true ->
+            erlang:send_after(500, DuoModePid,
+                              'cloudi_count_process_dynamic_terminate_check'),
+            {noreply, State}
+    end;
+
+duo_handle_info('cloudi_count_process_dynamic_terminate_now', State) ->
+    {stop, {shutdown, cloudi_count_process_dynamic_terminate}, State};
+
 duo_handle_info(Request,
                 #state_duo{queue_requests = true,
                            queued_info = QueueInfo} = State) ->
@@ -2202,15 +2828,24 @@ duo_handle_info(Request,
                            service_state = ServiceState,
                            dispatcher = Dispatcher,
                            options = ConfigOptions} = State) ->
-    NewConfigOptions = check_incoming(ConfigOptions),
+    NewConfigOptions = check_incoming(false, ConfigOptions),
     case handle_module_info(Request, Module, Dispatcher, ServiceState) of
         {'cloudi_service_info_success', NewServiceState} ->
-            {noreply, State#state_duo{service_state = NewServiceState,
-                                      options = NewConfigOptions}};
-        {'cloudi_service_info_failure', Reason, NewServiceState} ->
+            {noreply,
+             State#state_duo{service_state = NewServiceState,
+                             options = NewConfigOptions}};
+        {'cloudi_service_info_failure',
+         stop, Reason, undefined, NewServiceState} ->
             ?LOG_ERROR("duo_mode info stop ~p", [Reason]),
-            {stop, Reason, State#state_duo{service_state = NewServiceState,
-                                           options = NewConfigOptions}}
+            {stop, Reason,
+             State#state_duo{service_state = NewServiceState,
+                             options = NewConfigOptions}};
+        {'cloudi_service_info_failure',
+         Type, Error, Stack, NewServiceState} ->
+            ?LOG_ERROR("duo_mode info ~p ~p~n~p", [Type, Error, Stack]),
+            {stop, {Type, {Error, Stack}},
+             State#state_duo{service_state = NewServiceState,
+                             options = NewConfigOptions}}
     end.
 
 duo_process_queue_info(NewServiceState,
@@ -2225,16 +2860,24 @@ duo_process_queue_info(NewServiceState,
                             queue_requests = false,
                             queued_info = NewQueueInfo};
         {{value, Request}, NewQueueInfo} ->
-            NewConfigOptions = check_incoming(ConfigOptions),
+            NewConfigOptions = check_incoming(false, ConfigOptions),
             case handle_module_info(Request, Module, Dispatcher,
                                     NewServiceState) of
                 {'cloudi_service_info_success', NextServiceState} ->
                     duo_process_queue_info(NextServiceState,
                         State#state_duo{queued_info = NewQueueInfo,
                                         options = NewConfigOptions});
-                {'cloudi_service_info_failure', Reason, NextServiceState} ->
+                {'cloudi_service_info_failure',
+                 stop, Reason, undefined, NextServiceState} ->
                     ?LOG_ERROR("duo_mode info stop ~p", [Reason]),
                     {stop, Reason,
+                     State#state_duo{service_state = NextServiceState,
+                                     queued_info = NewQueueInfo,
+                                     options = NewConfigOptions}};
+                {'cloudi_service_info_failure',
+                 Type, Error, Stack, NextServiceState} ->
+                    ?LOG_ERROR("duo_mode info ~p ~p~n~p", [Type, Error, Stack]),
+                    {stop, {Type, {Error, Stack}},
                      State#state_duo{service_state = NextServiceState,
                                      queued_info = NewQueueInfo,
                                      options = NewConfigOptions}}
@@ -2265,7 +2908,7 @@ duo_process_queue(NewServiceState,
                 V ->
                     V
             end,
-            NewConfigOptions = check_incoming(ConfigOptions),
+            NewConfigOptions = check_incoming(true, ConfigOptions),
             State#state_duo{
                 recv_timeouts = dict:erase(TransId, RecvTimeouts),
                 queued = NewQueue,
@@ -2287,7 +2930,7 @@ duo_process_queue(NewServiceState,
                 V ->
                     V
             end,
-            NewConfigOptions = check_incoming(ConfigOptions),
+            NewConfigOptions = check_incoming(true, ConfigOptions),
             State#state_duo{
                 recv_timeouts = dict:erase(TransId, RecvTimeouts),
                 queued = NewQueue,

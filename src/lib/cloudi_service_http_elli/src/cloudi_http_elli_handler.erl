@@ -8,7 +8,7 @@
 %%%
 %%% BSD LICENSE
 %%% 
-%%% Copyright (c) 2013, Michael Truog <mjtruog at gmail dot com>
+%%% Copyright (c) 2013-2014, Michael Truog <mjtruog at gmail dot com>
 %%% All rights reserved.
 %%% 
 %%% Redistribution and use in source and binary forms, with or without
@@ -43,8 +43,8 @@
 %%% DAMAGE.
 %%%
 %%% @author Michael Truog <mjtruog [at] gmail (dot) com>
-%%% @copyright 2013 Michael Truog
-%%% @version 1.2.5 {@date} {@time}
+%%% @copyright 2013-2014 Michael Truog
+%%% @version 1.3.1 {@date} {@time}
 %%%------------------------------------------------------------------------
 
 -module(cloudi_http_elli_handler).
@@ -59,6 +59,7 @@
          handle_event/3]).
 
 -include_lib("cloudi_core/include/cloudi_logger.hrl").
+-include_lib("cloudi_core/include/cloudi_service_children.hrl").
 -include("cloudi_http_elli_handler.hrl").
 -include_lib("elli/include/cloudi_x_elli.hrl").
 
@@ -72,8 +73,8 @@
 
 %% Reply with a normal response. 'ok' can be used instead of '200'
 %%     to signal success.
-handle(Req, #elli_state{service = Service,
-                        timeout_async = TimeoutAsync,
+handle(Req, #elli_state{dispatcher = Dispatcher,
+                        context = Context,
                         output_type = OutputType,
                         default_content_type = DefaultContentType,
                         use_host_prefix = UseHostPrefix,
@@ -130,11 +131,11 @@ handle(Req, #elli_state{service = Service,
                                 [K, 0, <<"true">>, 0 | L];
                             V =:= false ->
                                 [K, 0, <<"false">>, 0 | L];
-                            true ->
+                            is_binary(V) ->
                                 [K, 0, V, 0 | L]
                         end
                     end, [],
-                    cloudi_x_cowboy_http:x_www_form_urlencoded(QsVals)))
+                    cloudi_x_cow_qs:parse_qs(QsVals)))
             end;
         Method =:= 'POST'; Method =:= 'PUT' ->
             % do not pass type information along with the request!
@@ -162,10 +163,9 @@ handle(Req, #elli_state{service = Service,
         OutputType =:= external; OutputType =:= binary ->
             headers_external_incoming(HeadersIncoming)
     end,
-    Self = self(),
-    Service ! {elli_request, Self, NameOutgoing, RequestInfo, Request},
-    receive
-        {elli_response, ResponseInfo, Response} ->
+    case send_sync_minimal(Dispatcher, Context,
+                           NameOutgoing, RequestInfo, Request, self()) of
+        {ok, ResponseInfo, Response} ->
             HeadersOutgoing = if
                 OutputType =:= internal; OutputType =:= list ->
                     ResponseInfo;
@@ -180,20 +180,7 @@ handle(Req, #elli_state{service = Service,
                              [HttpCode, Method, NameIncoming, NameOutgoing,
                               RequestStartMicroSec]),
             Result;
-        {elli_error, timeout} ->
-            HttpCode = 504,
-            ?LOG_WARN_APPLY(fun request_time_end_error/5,
-                            [HttpCode, Method, NameIncoming,
-                             RequestStartMicroSec, timeout]),
-            {HttpCode, [], <<>>};
-        {elli_error, Reason} ->
-            HttpCode = 500,
-            ?LOG_WARN_APPLY(fun request_time_end_error/5,
-                            [HttpCode, Method, NameIncoming,
-                             RequestStartMicroSec, Reason]),
-            {HttpCode, [], <<>>}
-    after
-        TimeoutAsync ->
+        {error, timeout} ->
             HttpCode = 504,
             ?LOG_WARN_APPLY(fun request_time_end_error/5,
                             [HttpCode, Method, NameIncoming,
@@ -238,19 +225,18 @@ headers_external_incoming(Result, [{K, V} | L]) when is_binary(K) ->
 
 headers_external_outgoing(<<>>) ->
     [];
-headers_external_outgoing(ResponseInfo) ->
-    Options = case binary:last(ResponseInfo) of
-        0 ->
-            [global, {scope, {0, erlang:byte_size(ResponseInfo) - 1}}];
-        _ ->
-            [global]
-    end,
-    headers_external_outgoing([], binary:split(ResponseInfo, <<0>>, Options)).
+headers_external_outgoing([] = ResponseInfo) ->
+    ResponseInfo;
+headers_external_outgoing([{_, _} | _] = ResponseInfo) ->
+    ResponseInfo;
+headers_external_outgoing(ResponseInfo)
+    when is_binary(ResponseInfo) ->
+    headers_external_outgoing(binary:split(ResponseInfo, <<0>>, [global]), []).
 
-headers_external_outgoing(Result, []) ->
-    Result;
-headers_external_outgoing(Result, [K, V | L]) ->
-    headers_external_outgoing([{K, V} | Result], L).
+headers_external_outgoing([<<>>], Result) ->
+    lists:reverse(Result);
+headers_external_outgoing([K, V | L], Result) ->
+    headers_external_outgoing(L, [{K, V} | Result]).
 
 request_time_start() ->
     cloudi_x_uuid:get_v1_time(os).

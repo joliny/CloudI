@@ -9,7 +9,7 @@
 %%%
 %%% BSD LICENSE
 %%% 
-%%% Copyright (c) 2013, Michael Truog <mjtruog at gmail dot com>
+%%% Copyright (c) 2013-2014, Michael Truog <mjtruog at gmail dot com>
 %%% All rights reserved.
 %%% 
 %%% Redistribution and use in source and binary forms, with or without
@@ -44,8 +44,8 @@
 %%% DAMAGE.
 %%%
 %%% @author Michael Truog <mjtruog [at] gmail (dot) com>
-%%% @copyright 2013 Michael Truog
-%%% @version 1.3.0 {@date} {@time}
+%%% @copyright 2013-2014 Michael Truog
+%%% @version 1.3.1 {@date} {@time}
 %%%------------------------------------------------------------------------
 
 -module(cloudi_runtime_testing).
@@ -62,8 +62,14 @@
          monkey_chaos_check/1]).
 
 -include("cloudi_logger.hrl").
+-include("cloudi_constants.hrl").
 
--define(MONKEY_LATENCY_EXTREME, 5000).
+-define(MONKEY_LATENCY_DEFAULT, 5000). % milliseconds
+-define(MONKEY_LATENCY_LOG, 5000). % milliseconds
+
+-type time_milliseconds() ::
+    1..?TIMEOUT_MAX_ERLANG.
+-export_type([time_milliseconds/0]).
 
 -record(monkey_latency,
     {
@@ -118,11 +124,9 @@ monkey_latency_validate(system) ->
 monkey_latency_validate(Options) ->
     monkey_latency_validate(Options, #monkey_latency{}).
 
--spec monkey_latency_init(#monkey_latency{} | system | false) ->
-    #monkey_latency{} | false.
+-spec monkey_latency_init(#monkey_latency{} | system) ->
+    #monkey_latency{}.
 
-monkey_latency_init(false) ->
-    false;
 monkey_latency_init(system) ->
     Options = application:get_env(cloudi_core, monkey_latency, false),
     true = (Options =/= system),
@@ -131,11 +135,9 @@ monkey_latency_init(system) ->
 monkey_latency_init(#monkey_latency{} = MonkeyLatency) ->
     MonkeyLatency.
 
--spec monkey_latency_check(#monkey_latency{} | false) ->
-    #monkey_latency{} | false.
+-spec monkey_latency_check(#monkey_latency{}) ->
+    #monkey_latency{}.
 
-monkey_latency_check(false) ->
-    false;
 monkey_latency_check(#monkey_latency{method = time_uniform,
                                      value1 = Min,
                                      value2 = Max} = MonkeyLatency) ->
@@ -194,24 +196,22 @@ monkey_chaos_validate(system) ->
 monkey_chaos_validate(Options) ->
     monkey_chaos_validate(Options, #monkey_chaos{}).
 
--spec monkey_chaos_init(#monkey_chaos{} | system | false) ->
-    #monkey_chaos{} | false.
+-spec monkey_chaos_init(#monkey_chaos{} | system) ->
+    #monkey_chaos{}.
 
-monkey_chaos_init(false) ->
-    false;
 monkey_chaos_init(system) ->
     Options = application:get_env(cloudi_core, monkey_chaos, false),
     true = (Options =/= system),
     {ok, MonkeyChaos} = monkey_chaos_validate(Options),
+    monkey_chaos_init(MonkeyChaos);
+monkey_chaos_init(#monkey_chaos{method = probability_day} = MonkeyChaos) ->
     monkey_chaos_check(MonkeyChaos);
 monkey_chaos_init(#monkey_chaos{} = MonkeyChaos) ->
-    monkey_chaos_check(MonkeyChaos).
+    MonkeyChaos.
 
--spec monkey_chaos_check(#monkey_chaos{} | false) ->
-    #monkey_chaos{} | false.
+-spec monkey_chaos_check(#monkey_chaos{}) ->
+    #monkey_chaos{}.
 
-monkey_chaos_check(false) ->
-    false;
 monkey_chaos_check(#monkey_chaos{method = probability_request,
                                  value1 = Percent} = MonkeyChaos) ->
     X = random(),
@@ -244,7 +244,7 @@ monkey_latency_validate([],
             {ok,
              MonkeyLatency#monkey_latency{
                 method = time_absolute,
-                value1 = ?MONKEY_LATENCY_EXTREME}};
+                value1 = ?MONKEY_LATENCY_DEFAULT}};
         Method =/= undefined ->
             {ok, MonkeyLatency}
     end;
@@ -252,7 +252,7 @@ monkey_latency_validate([{time_uniform_min, Min} | Options],
                         #monkey_latency{method = Method,
                                         value2 = Max} = MonkeyLatency)
     when ((Method =:= undefined) orelse (Method =:= time_uniform)),
-         is_integer(Min), Min > 0 ->
+         is_integer(Min), Min >= 0, Min =< ?TIMEOUT_MAX_ERLANG ->
     NewMax = if
         Max =:= undefined ->
             Min;
@@ -268,7 +268,7 @@ monkey_latency_validate([{time_uniform_max, Max} | Options],
                         #monkey_latency{method = Method,
                                         value1 = Min} = MonkeyLatency)
     when ((Method =:= undefined) orelse (Method =:= time_uniform)),
-         is_integer(Max), Max > 0 ->
+         is_integer(Max), Max > 0, Max =< ?TIMEOUT_MAX_ERLANG ->
     NewMin = if
         Min =:= undefined ->
             Max;
@@ -285,7 +285,7 @@ monkey_latency_validate([{time_gaussian_mean, Mean} | Options],
                             method = Method,
                             value2 = StdDev} = MonkeyLatency)
     when ((Method =:= undefined) orelse (Method =:= time_gaussian)),
-         is_integer(Mean), Mean > 0 ->
+         is_integer(Mean), Mean >= 0, Mean =< ?TIMEOUT_MAX_ERLANG ->
     NewStdDev = if
         StdDev =:= undefined ->
             % most values are within 3-sigma,
@@ -306,7 +306,7 @@ monkey_latency_validate([{time_gaussian_stddev, StdDev} | Options],
          is_number(StdDev), StdDev > 0.0 ->
     NewMean = if
         Mean =:= undefined ->
-            ?MONKEY_LATENCY_EXTREME;
+            ?MONKEY_LATENCY_DEFAULT;
         Mean =/= undefined ->
             Mean
     end,
@@ -318,7 +318,7 @@ monkey_latency_validate([{time_gaussian_stddev, StdDev} | Options],
 monkey_latency_validate([{time_absolute, Time} | Options],
                         #monkey_latency{method = Method} = MonkeyLatency)
     when ((Method =:= undefined) orelse (Method =:= time_absolute)),
-         is_integer(Time), Time > 0 ->
+         is_integer(Time), Time > 0, Time =< ?TIMEOUT_MAX_ERLANG ->
     monkey_latency_validate(Options,
                             MonkeyLatency#monkey_latency{
                                 method = time_absolute,
@@ -360,10 +360,21 @@ monkey_chaos_validate([Invalid | _Options],
     {error, {service_options_monkey_chaos_invalid, Invalid}}.
 
 sleep(Time)
-    when Time > ?MONKEY_LATENCY_EXTREME ->
+    when Time > ?TIMEOUT_MAX_ERLANG ->
+    ?LOG_WARN("monkey_latency delay ~p ms", [Time]),
+    sleep_loop(Time);
+sleep(Time)
+    when Time > ?MONKEY_LATENCY_LOG ->
     ?LOG_WARN("monkey_latency delay ~p ms", [Time]),
     receive after Time -> ok end;
 sleep(Time) ->
+    receive after Time -> ok end.
+
+sleep_loop(Time)
+    when Time > ?TIMEOUT_MAX_ERLANG ->
+    receive after ?TIMEOUT_MAX_ERLANG -> ok end,
+    sleep_loop(Time - ?TIMEOUT_MAX_ERLANG);
+sleep_loop(Time) ->
     receive after Time -> ok end.
 
 monkey_chaos_pid_day(Percent)
@@ -393,5 +404,5 @@ monkey_chaos_pid_day(Percent)
 
 % return a floating point value between 0.0 and 1.0, inclusive
 random() ->
-    quickrand:strong_float().
+    cloudi_x_quickrand:strong_float().
 

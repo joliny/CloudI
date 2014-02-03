@@ -9,7 +9,7 @@
 %%%
 %%% BSD LICENSE
 %%% 
-%%% Copyright (c) 2012-2013, Michael Truog <mjtruog at gmail dot com>
+%%% Copyright (c) 2012-2014, Michael Truog <mjtruog at gmail dot com>
 %%% All rights reserved.
 %%% 
 %%% Redistribution and use in source and binary forms, with or without
@@ -44,8 +44,8 @@
 %%% DAMAGE.
 %%%
 %%% @author Michael Truog <mjtruog [at] gmail (dot) com>
-%%% @copyright 2012-2013 Michael Truog
-%%% @version 1.3.0 {@date} {@time}
+%%% @copyright 2012-2014 Michael Truog
+%%% @version 1.3.1 {@date} {@time}
 %%%------------------------------------------------------------------------
 
 -module(cloudi_service_http_cowboy).
@@ -54,6 +54,7 @@
 -behaviour(cloudi_service).
 
 %% external interface
+-export([close/1]).
 
 %% cloudi_service callbacks
 -export([cloudi_service_init/3,
@@ -62,6 +63,7 @@
          cloudi_service_terminate/2]).
 
 -include_lib("cloudi_core/include/cloudi_logger.hrl").
+-include_lib("cloudi_core/include/cloudi_service_children.hrl").
 -include("cloudi_http_cowboy_handler.hrl").
 
 -define(DEFAULT_INTERFACE,            {127,0,0,1}). % ip address
@@ -70,6 +72,8 @@
 -define(DEFAULT_NODELAY,                     true).
 -define(DEFAULT_RECV_TIMEOUT,           30 * 1000). % milliseconds
 -define(DEFAULT_WEBSOCKET_TIMEOUT,       infinity). % milliseconds
+-define(DEFAULT_WEBSOCKET_CONNECT,      undefined).
+-define(DEFAULT_WEBSOCKET_DISCONNECT,   undefined).
 -define(DEFAULT_SSL,                        false).
 -define(DEFAULT_COMPRESS,                   false).
 -define(DEFAULT_MAX_CONNECTIONS,             4096).
@@ -85,21 +89,42 @@
 -define(DEFAULT_STATUS_CODE_TIMEOUT,          504). % "Gateway Timeout"
 -define(DEFAULT_SET_X_FORWARDED_FOR,        false). % if it is missing
 -define(DEFAULT_USE_WEBSOCKETS,             false).
+-define(DEFAULT_USE_SPDY,                   false).
 -define(DEFAULT_USE_HOST_PREFIX,            false). % for virtual hosts
 -define(DEFAULT_USE_CLIENT_IP_PREFIX,       false).
 -define(DEFAULT_USE_METHOD_SUFFIX,           true). % get/post/etc. name suffix
 
-
 -record(state,
     {
         listener,
-        service,
-        requests = dict:new()
+        service
     }).
 
 %%%------------------------------------------------------------------------
 %%% External interface functions
 %%%------------------------------------------------------------------------
+
+
+%%-------------------------------------------------------------------------
+%% @doc
+%% ===Close a cowboy handler socket pid which represents a live connection.===
+%% Use the Pid from cloudi_service_handle_request/11.  Otherwise, you can
+%% use either the get_pid function or get_pids function in the cloudi module
+%% (or the cloudi_service module) to find a match for the connection URL.
+%% @end
+%%-------------------------------------------------------------------------
+
+-spec close(pid() | {string(), pid()}) ->
+    ok.
+
+close(Pid)
+    when is_pid(Pid) ->
+    Pid ! {cowboy_error, shutdown},
+    ok;
+close({Pattern, Pid})
+    when is_list(Pattern), is_pid(Pid) ->
+    Pid ! {cowboy_error, shutdown},
+    ok.
 
 %%%------------------------------------------------------------------------
 %%% Callback functions from cloudi_service
@@ -113,6 +138,8 @@ cloudi_service_init(Args, Prefix, Dispatcher) ->
         {nodelay,                  ?DEFAULT_NODELAY},
         {recv_timeout,             ?DEFAULT_RECV_TIMEOUT},
         {websocket_timeout,        ?DEFAULT_WEBSOCKET_TIMEOUT},
+        {websocket_connect,        ?DEFAULT_WEBSOCKET_CONNECT},
+        {websocket_disconnect,     ?DEFAULT_WEBSOCKET_DISCONNECT},
         {ssl,                      ?DEFAULT_SSL},
         {compress,                 ?DEFAULT_COMPRESS},
         {max_connections,          ?DEFAULT_MAX_CONNECTIONS},
@@ -128,23 +155,28 @@ cloudi_service_init(Args, Prefix, Dispatcher) ->
         {set_x_forwarded_for,      ?DEFAULT_SET_X_FORWARDED_FOR},
         {status_code_timeout,      ?DEFAULT_STATUS_CODE_TIMEOUT},
         {use_websockets,           ?DEFAULT_USE_WEBSOCKETS},
+        {use_spdy,                 ?DEFAULT_USE_SPDY},
         {use_host_prefix,          ?DEFAULT_USE_HOST_PREFIX},
         {use_client_ip_prefix,     ?DEFAULT_USE_CLIENT_IP_PREFIX},
         {use_method_suffix,        ?DEFAULT_USE_METHOD_SUFFIX}],
     [Interface, Port, Backlog, NoDelay, RecvTimeout, WebsocketTimeout,
-     SSL, Compress, MaxConnections,
+     WebsocketConnect, WebsocketDisconnect, SSL, Compress, MaxConnections,
      MaxEmptyLines, MaxHeaderNameLength, MaxHeaderValueLength,
      MaxHeaders, MaxKeepAlive, MaxRequestLineLength,
      OutputType, ContentTypeForced0, ContentTypesAccepted0, SetXForwardedFor,
-     StatusCodeTimeout, UseWebSockets, UseHostPrefix, UseClientIpPrefix,
-     UseMethodSuffix] =
+     StatusCodeTimeout, UseWebSockets, UseSpdy,
+     UseHostPrefix, UseClientIpPrefix, UseMethodSuffix] =
         cloudi_proplists:take_values(Defaults, Args),
     true = is_integer(Port),
     true = is_integer(Backlog),
     true = is_boolean(NoDelay),
     true = is_integer(RecvTimeout) andalso (RecvTimeout > 0),
     true = (WebsocketTimeout =:= infinity) orelse
-           (is_integer(WebsocketTimeout) andalso WebsocketTimeout > 0),
+           (is_integer(WebsocketTimeout) andalso (WebsocketTimeout > 0)),
+    true = (WebsocketConnect =:= undefined) orelse
+           is_list(WebsocketConnect),
+    true = (WebsocketDisconnect =:= undefined) orelse
+           is_list(WebsocketDisconnect),
     true = is_boolean(Compress),
     true = is_integer(MaxConnections),
     true = is_integer(MaxEmptyLines),
@@ -153,8 +185,8 @@ cloudi_service_init(Args, Prefix, Dispatcher) ->
     true = is_integer(MaxHeaders),
     true = is_integer(MaxKeepAlive),
     true = is_integer(MaxRequestLineLength),
-    true = OutputType =:= external orelse OutputType =:= internal orelse
-           OutputType =:= list orelse OutputType =:= binary,
+    true = (OutputType =:= external) orelse (OutputType =:= internal) orelse
+           (OutputType =:= list) orelse (OutputType =:= binary),
     ContentTypeForced1 = if
         ContentTypeForced0 =:= undefined ->
             undefined;
@@ -172,16 +204,16 @@ cloudi_service_init(Args, Prefix, Dispatcher) ->
     true = is_boolean(SetXForwardedFor),
     true = is_integer(StatusCodeTimeout),
     true = is_boolean(UseWebSockets),
+    true = is_boolean(UseSpdy),
     true = is_boolean(UseHostPrefix),
     true = is_boolean(UseClientIpPrefix),
     true = is_boolean(UseMethodSuffix),
-    Service = cloudi_service:self(Dispatcher),
-    TimeoutAsync = cloudi_service:timeout_async(Dispatcher),
     Dispatch = cloudi_x_cowboy_router:compile([
         %% {Host, list({Path, Handler, Opts})}
         {'_', [{'_', cloudi_http_cowboy_handler,
-                #cowboy_state{service = Service,
-                              timeout_async = TimeoutAsync,
+                #cowboy_state{dispatcher =
+                                  cloudi_service:dispatcher(Dispatcher),
+                              context = create_context(Dispatcher),
                               prefix = Prefix,
                               timeout_websocket = WebsocketTimeout,
                               output_type = OutputType,
@@ -189,12 +221,23 @@ cloudi_service_init(Args, Prefix, Dispatcher) ->
                               content_types_accepted = ContentTypesAccepted1,
                               set_x_forwarded_for = SetXForwardedFor,
                               status_code_timeout = StatusCodeTimeout,
+                              websocket_connect = WebsocketConnect,
+                              websocket_disconnect = WebsocketDisconnect,
                               use_websockets = UseWebSockets,
                               use_host_prefix = UseHostPrefix,
                               use_client_ip_prefix = UseClientIpPrefix,
                               use_method_suffix = UseMethodSuffix,
                               content_type_lookup = content_type_lookup()}}]}
     ]),
+    Service = cloudi_service:self(Dispatcher),
+    StartFunction = if
+        UseSpdy =:= true ->
+            start_spdy;
+        is_list(SSL) ->
+            start_https;
+        SSL =:= false ->
+            start_http
+    end,
     {ok, ListenerPid} = if
         is_list(SSL) ->
             {value,
@@ -204,7 +247,7 @@ cloudi_service_init(Args, Prefix, Dispatcher) ->
                                               keyfile,
                                               password,
                                               verify], SSLOpts),
-            cloudi_x_cowboy:start_https(
+            cloudi_x_cowboy:StartFunction(
                 Service, % Ref
                 100, % Number of acceptor processes
                 [{ip, Interface},
@@ -225,7 +268,7 @@ cloudi_service_init(Args, Prefix, Dispatcher) ->
                  {timeout, RecvTimeout}] % Protocol options
             );
         SSL =:= false ->
-            cloudi_x_cowboy:start_http(
+            cloudi_x_cowboy:StartFunction(
                 Service, % Ref
                 100, % Number of acceptor processes
                 [{ip, Interface},
@@ -252,43 +295,12 @@ cloudi_service_handle_request(_Type, _Name, _Pattern, _RequestInfo, _Request,
                               State, _Dispatcher) ->
     {reply, <<>>, State}.
 
-cloudi_service_handle_info({cowboy_request, HandlerPid, NameOutgoing,
-                            RequestInfo, Request},
-                           #state{requests = Requests} = State, Dispatcher) ->
-    case cloudi_service:send_async_active(Dispatcher, NameOutgoing,
-                                          RequestInfo, Request,
-                                          undefined, undefined) of
-        {ok, TransId} ->
-            {noreply, State#state{requests = dict:store(TransId, HandlerPid,
-                                                        Requests)}};
-        {error, Reason} ->
-            HandlerPid ! {cowboy_error, Reason},
-            {noreply, State}
-    end;
-
-cloudi_service_handle_info({'return_async_active', _Name, _Pattern,
-                            ResponseInfo, Response, _Timeout, TransId},
-                           #state{requests = Requests} = State, _) ->
-    HandlerPid = dict:fetch(TransId, Requests),
-    HandlerPid ! {cowboy_response, ResponseInfo, Response},
-    {noreply, State#state{requests = dict:erase(TransId, Requests)}};
-
-cloudi_service_handle_info({'timeout_async_active', TransId},
-                           #state{requests = Requests} = State, _) ->
-    HandlerPid = dict:fetch(TransId, Requests),
-    HandlerPid ! {cowboy_error, timeout},
-    {noreply, State#state{requests = dict:erase(TransId, Requests)}};
-
 cloudi_service_handle_info(Request, State, _) ->
     ?LOG_WARN("Unknown info \"~p\"", [Request]),
     {noreply, State}.
 
-cloudi_service_terminate(_, #state{service = Service,
-                                   requests = Requests}) ->
+cloudi_service_terminate(_, #state{service = Service}) ->
     cloudi_x_cowboy:stop_listener(Service),
-    dict:map(fun(_, HandlerPid) ->
-        HandlerPid ! {cowboy_error, timeout}
-    end, Requests),
     ok.
 
 %%%------------------------------------------------------------------------

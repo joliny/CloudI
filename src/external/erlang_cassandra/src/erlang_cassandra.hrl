@@ -10,7 +10,7 @@
 %%% retrieved from: http://www.opensource.org/licenses/bsd-license.php
 %%%-------------------------------------------------------------------
 
--include("cassandra_types.hrl").
+-include("erlang_cassandra_types.hrl").
 
 
 -type error()           :: {error, Reason :: term()}.
@@ -25,7 +25,7 @@
 -type type()            :: binary().
 -type id()              :: binary() | undefined.
 -type doc()             :: binary().
--type params()          :: [tuple()].
+-type params()          ::[tuple()].
 -type client_name()     :: binary().
 -type registered_client_name() :: atom().
 -type registered_pool_name()   :: atom().
@@ -65,7 +65,8 @@
 -type compression()     :: binary().
 
 %% Defaults
--define(DEFAULT_KEYSPACE, <<"default_erlang_cassandra_keyspace">>).
+-define(DUMMY_STARTUP_POOL, <<"_dummy_startup_pool">>).
+-define(DEFAULT_KEYSPACE_OPS_POOL, <<"default_keyspace_ops_pool">>).
 -define(DEFAULT_THRIFT_HOST, "localhost").
 -define(DEFAULT_THRIFT_PORT, 9160).
 -define(DEFAULT_THRIFT_OPTIONS, [{framed, true}]).
@@ -83,9 +84,13 @@
 -define(POOL_TIMEOUT, 10000).
 -define(REGISTERED_NAME_PREFIX, "erlang_cassandra_").
 -define(DEFAULT_SLICE_COUNT, 1000).
+-define(MAX_RECONNECT_INTERVAL, 30000).
 
 %% Errors
+-define(INVALID_KEYSPACE, invalid_keyspace).
 -define(NO_SUCH_SEQUENCE, no_such_sequence).
+-define(CONNECTION_REFUSED, {error, econnrefused}).
+
 
 %% Methods
 -define(STATE, <<"_cluster/state">>).

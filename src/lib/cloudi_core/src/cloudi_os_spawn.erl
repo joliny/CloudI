@@ -45,7 +45,7 @@
 %%%
 %%% @author Michael Truog <mjtruog [at] gmail (dot) com>
 %%% @copyright 2011-2013 Michael Truog
-%%% @version 1.2.0 {@date} {@time}
+%%% @version 1.3.1 {@date} {@time}
 %%%------------------------------------------------------------------------
 
 -module(cloudi_os_spawn).
@@ -62,7 +62,17 @@
          terminate/2, code_change/3]).
 
 -include("cloudi_logger.hrl").
+-include("cloudi_constants.hrl").
+-ifdef(CLOUDI_CORE_STANDALONE).
+-export([spawn/7]).
+-define(ERL_PORT_NAME, "/dev/null").
+-compile({nowarn_unused_function, [{call_port_sync, 3}]}).
+spawn(_SpawnProcess, _SpawnProtocol, _SpawnSocketPath, _Ports,
+      _SpawnFilename, _SpawnArguments, _SpawnEnvironment) ->
+    erlang:exit(badarg).
+-else.
 -include("cloudi_os_spawn.hrl").
+-endif.
 
 -record(state, {last_port_name,
                 replies = [],
